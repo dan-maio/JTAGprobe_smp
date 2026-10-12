@@ -484,6 +484,12 @@ cmsis-dap cmd 0x80 <i>      ;# read counter i (0..11): "Returned data b0 b1 b2 b
 | 4 | DAP waiting for a free response slot (µs) | 10 | gaps ≥ 10 ms (host idle) |
 | 5 | response ready → IN started (µs) | 11 | OUT stalls (request ring full) |
 
+### 8.6 How the kernel and the two cores are used
+- **Kernel:** one µOS++ III SMP scheduler for both cores. Each thread is created with a priority and a CPU affinity (`th_cpu_affinity`, `create_thread()` in `src/main.c`): `UART` (high) and `TUD` (above normal) on core 0, `DAP` alone on core 1. On core 0 the scheduler preempts by priority, so the UART bridge always runs ahead of USB.
+- **Kernel objects:** `usb_mutex` serializes every tinyusb call from either core; the binary semaphores `usb_sem`, `dap_sem` and `uart_sem` wake a sleeping thread when it has work.
+- **Packet path outside the kernel:** during a transfer the requests and responses pass through the lock-free rings (§ 8.3) and the threads spin (§ 8.4); the kernel sleeps and wakes threads only when the probe goes idle and becomes active again. A cross-core sleep and wake-up per packet cost the first build a factor of 4 (§ 9.2).
+- **Core usage during a load** (512-byte packets, counters of § 9.6): core 1 bit-bangs JTAG for ~580 µs of each ~1,740 µs cycle (about ⅓) and spins for the rest; core 0 handles the USB events of the request and response transfers, ~7 µs to start each response, and the UART bridge. For about ⅔ of each cycle neither core has useful work, waiting on USB and the PC: the CPUs are not the bottleneck. After 2 ms without packets both threads sleep on their semaphores. These shares come from the per-stage packet timing; no per-core CPU-load counter was measured.
+
 ---
 
 ## 9. Measured OpenOCD Load Times (Raspberry Pi 4 B)

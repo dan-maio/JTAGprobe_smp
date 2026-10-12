@@ -60,6 +60,22 @@ tinyusb is built with `OPT_OS_NONE`; every tinyusb call is made with `usb_mutex`
 
 DAP packets are **512 bytes** (`DAP_PACKET_SIZE`, CMSIS-DAP v2) over the 64-byte full-speed bulk endpoint, so OpenOCD packs eight times more into each round trip. A request arrives as up to eight USB packets; since the host sends no ZLP, `dap_req_len()` parses the DAP command lengths to find where a request ends on a full 64-byte packet, and a response of a 64-byte multiple shorter than 512 bytes is followed by a ZLP.
 
+### How µOS++ III SMP is used
+
+- **One kernel, two cores.** `main()` starts on core 0 under the kernel; `os_rp2040_start_core1()` brings core 1 into the same SMP scheduler, with its own idle thread.
+- **Threads pinned to cores.** `create_thread()` in `src/main.c` sets each thread's priority and CPU affinity (`th_cpu_affinity`): `UART` and `TUD` on core 0, `DAP` alone on core 1. On core 0 the scheduler preempts by priority, so the UART bridge always runs ahead of USB; on core 1 nothing ever interrupts the JTAG work.
+- **Kernel objects for synchronization.** `usb_mutex` makes every tinyusb call exclusive (tinyusb is not thread-safe, and both cores call it). The binary semaphores `usb_sem`, `dap_sem` and `uart_sem` wake a sleeping thread when it has work: a USB event wakes `TUD`, a new request wakes `DAP`, UART data wakes `UART`.
+- **The packet path stays outside the kernel.** During a transfer, requests and responses pass through the two lock-free rings and the threads spin instead of sleeping. Sleeping and waking across cores for every packet is what made the first SMP build 4× slower. The kernel only puts a thread to sleep, and wakes it, when the probe goes idle and becomes active again.
+
+### How the two cores are used
+
+| Core | Threads | Work during a load (512-byte packets, probe counters) |
+| :---: | :--- | :--- |
+| 0 | `UART`, `TUD` | USB events while a request comes in and a response goes out, ~7 µs to start each response, and the UART bridge whenever the console has data |
+| 1 | `DAP` | ~580 µs of JTAG bit-banging in each ~1,740 µs packet cycle (about ⅓); the rest it spins, waiting for the next request |
+
+For the other ~⅔ of each cycle neither core has useful work: they wait on the USB transfers and the PC's turnaround. So the Pico's CPUs are not the bottleneck; the round trip to the PC is. After 2 ms without packets both threads sleep on their semaphores, and an idle probe uses almost no CPU. (These shares come from the per-stage packet timing; no per-core CPU-load counter was measured.)
+
 ### Packet timing
 
 The firmware keeps per-stage packet timing (OUT → DAP start, DAP execution, response → IN, IN transfer, OUT → OUT, OUT stalls), read from OpenOCD with the DAP vendor command `0x80`:
