@@ -91,7 +91,17 @@ This information includes:
 /// This configuration settings is used to optimize the communication performance with the
 /// debugger and depends on the USB peripheral. Typical vales are 64 for Full-speed USB HID or WinUSB,
 /// 1024 for High-speed USB HID and 512 for High-speed USB WinUSB.
+///
+/// CMSIS-DAP v2 (bulk): 512 bytes, carried as up to eight 64-byte full-speed
+/// USB packets. OpenOCD sizes its JTAG queue to it, so one round trip moves
+/// eight times as much. tusb_edpt_handler.c finds where a request ends and
+/// sends a ZLP after a short response of a 64-byte multiple.
+/// CMSIS-DAP v1 (HID): one 64-byte report per packet.
+#if (PROBE_DEBUG_PROTOCOL == PROTO_DAP_V1)
 #define DAP_PACKET_SIZE         64U            ///< Specifies Packet Size in bytes.
+#else
+#define DAP_PACKET_SIZE         512U           ///< Specifies Packet Size in bytes.
+#endif
 
 /// Maximum Package Buffers for Command and Response data.
 /// This configuration settings is used to optimize the communication performance with the

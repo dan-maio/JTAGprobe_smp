@@ -48,6 +48,23 @@ static volatile bool out_stalled;
 /* An IN transfer of a response is in flight ("usb" thread only). */
 static bool in_busy;
 
+/*
+ * A DAP packet (DAP_PACKET_SIZE) is larger than a full-speed bulk packet
+ * (DAP_EP_SIZE), and a USB transfer ends only on a short packet: the host
+ * sends no ZLP after a request of an exact multiple of 64 bytes. So the OUT
+ * endpoint is armed one USB packet at a time, and after each full one
+ * dap_req_len() tells whether the request ends there. On IN, a response of
+ * a 64-byte multiple shorter than DAP_PACKET_SIZE is followed by a ZLP,
+ * since the host reads up to DAP_PACKET_SIZE.
+ */
+#define DAP_EP_SIZE 64u
+
+/* Bytes of the request received so far in the current request slot. */
+static uint32_t out_len;
+
+/* A ZLP must follow the IN transfer in flight ("usb" thread only). */
+static bool in_zlp;
+
 static uint8_t DAPRequestBuffer[DAP_PACKET_SIZE];
 static uint8_t DAPResponseBuffer[DAP_PACKET_SIZE];
 
@@ -98,6 +115,107 @@ bool buffer_full(buffer_t *buffer)
 bool buffer_empty(buffer_t *buffer)
 {
 	return (buffer->wptr == buffer->rptr);
+}
+
+#define DAP_REQ_MORE 0xFFFFFFFFu
+
+// Length of the DAP command at p, of which have bytes arrived, or
+// DAP_REQ_MORE if it needs more. The fixed lengths matter inside
+// Queue/ExecuteCommands, where they place the next command.
+static uint32_t dap_req_len(const uint8_t *p, uint32_t have)
+{
+#define NEED(n) do { if ((n) > have) return DAP_REQ_MORE; } while (0)
+	uint32_t len, i, n;
+
+	NEED(1);
+	switch (p[0]) {
+	case ID_DAP_Disconnect:
+	case ID_DAP_TransferAbort:
+	case ID_DAP_ResetTarget:
+	case ID_DAP_SWO_Status:
+		return 1;
+	case ID_DAP_Info:
+	case ID_DAP_Connect:
+	case ID_DAP_SWD_Configure:
+	case ID_DAP_JTAG_IDCODE:
+	case ID_DAP_SWO_Transport:
+	case ID_DAP_SWO_Mode:
+	case ID_DAP_SWO_Control:
+	case ID_DAP_SWO_ExtendedStatus:
+	case ID_DAP_Vendor0:		// packet timing: cmd field
+		return 2;
+	case ID_DAP_HostStatus:
+	case ID_DAP_Delay:
+	case ID_DAP_SWO_Data:
+		return 3;
+	case ID_DAP_SWJ_Clock:
+	case ID_DAP_SWO_Baudrate:
+		return 5;
+	case ID_DAP_TransferConfigure:
+	case ID_DAP_WriteABORT:
+		return 6;
+	case ID_DAP_SWJ_Pins:
+		return 7;
+	}
+
+	NEED(2);
+	switch (p[0]) {
+	case ID_DAP_Transfer:		// cmd index count {request [data]}
+		NEED(3);
+		for (len = 3, i = 0; i < p[2]; i++) {
+			NEED(len + 1);
+			uint8_t r = p[len++];
+			if (!(r & DAP_TRANSFER_RnW) || (r & DAP_TRANSFER_MATCH_VALUE))
+				len += 4;
+		}
+		return len;
+	case ID_DAP_TransferBlock:	// cmd index count:16 request [data]
+		NEED(5);
+		n = p[2] | (p[3] << 8);
+		return 5 + ((p[4] & DAP_TRANSFER_RnW) ? 0 : 4 * n);
+	case ID_DAP_SWJ_Sequence:	// cmd bits data
+		n = p[1] ? p[1] : 256;
+		return 2 + (n + 7) / 8;
+	case ID_DAP_SWD_Sequence:	// cmd count {info [data]}
+		for (len = 2, i = 0; i < p[1]; i++) {
+			NEED(len + 1);
+			uint8_t info = p[len++];
+			n = (info & SWD_SEQUENCE_CLK) ? (info & SWD_SEQUENCE_CLK) : 64;
+			if (!(info & SWD_SEQUENCE_DIN))
+				len += (n + 7) / 8;
+		}
+		return len;
+	case ID_DAP_JTAG_Sequence:	// cmd count {info tdi}
+		for (len = 2, i = 0; i < p[1]; i++) {
+			NEED(len + 1);
+			uint8_t info = p[len++];
+			n = (info & JTAG_SEQUENCE_TCK) ? (info & JTAG_SEQUENCE_TCK) : 64;
+			len += (n + 7) / 8;
+		}
+		return len;
+	case ID_DAP_JTAG_Configure:	// cmd count {ir_length}
+		return 2 + p[1];
+	case ID_DAP_QueueCommands:	// cmd count {command}
+	case ID_DAP_ExecuteCommands:
+		for (len = 2, i = 0; i < p[1]; i++) {
+			NEED(len + 1);
+			n = dap_req_len(p + len, have - len);
+			if (n == DAP_REQ_MORE)
+				return DAP_REQ_MORE;
+			len += n;
+		}
+		return len;
+	default:
+		return 1;
+	}
+#undef NEED
+}
+
+// Arm the OUT endpoint for the next USB packet of the current request.
+// usb_mutex held.
+static void dap_arm_out(uint8_t rhport)
+{
+	usbd_edpt_xfer(rhport, _out_ep_addr, WR_SLOT_PTR(USBRequestBuffer) + out_len, DAP_EP_SIZE);
 }
 
 void dap_edpt_init(void) {
@@ -158,6 +276,8 @@ uint16_t dap_edpt_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, ui
 	// Initialise the endpoint states
 	out_stalled = false;
 	in_busy = false;
+	in_zlp = false;
+	out_len = 0;
 
 	uint16_t const drv_len = sizeof(tusb_desc_interface_t) + (itf_desc->bNumEndpoints * sizeof(tusb_desc_endpoint_t));
 	TU_VERIFY(max_len >= drv_len, 0);
@@ -172,7 +292,7 @@ uint16_t dap_edpt_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, ui
 
 	// The OUT endpoint requires a call to usbd_edpt_xfer to initialise the endpoint, giving tinyUSB a buffer to consume when a transfer occurs at the endpoint
 	usbd_edpt_open(rhport, edpt_desc);
-	usbd_edpt_xfer(rhport, ep_addr, WR_SLOT_PTR(USBRequestBuffer), DAP_PACKET_SIZE);
+	dap_arm_out(rhport);
 
 	// Initiliasing the IN endpoint
 
@@ -204,8 +324,9 @@ static void dap_edpt_start_in(void)
 		in_busy = true;
 		t_in_start = time_us_32();
 		dap_stats.inq_us += t_in_start - t_resp[RD_IDX(USBResponseBuffer)];
-		usbd_edpt_xfer(_rhport, _in_ep_addr, RD_SLOT_PTR(USBResponseBuffer),
-			       USBResponseBuffer.resp_len[RD_IDX(USBResponseBuffer)]);
+		uint16_t len = USBResponseBuffer.resp_len[RD_IDX(USBResponseBuffer)];
+		in_zlp = (len % DAP_EP_SIZE) == 0 && len < DAP_PACKET_SIZE;
+		usbd_edpt_xfer(_rhport, _in_ep_addr, RD_SLOT_PTR(USBResponseBuffer), len);
 	}
 }
 
@@ -219,6 +340,14 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 	{
 		if(xferred_bytes >= 0u && xferred_bytes <= DAP_PACKET_SIZE)
 		{
+			// A full response shorter than the host's read: end it.
+			if(in_zlp)
+			{
+				in_zlp = false;
+				usbd_edpt_xfer(rhport, ep_addr, NULL, 0);
+				return true;
+			}
+
 			// The response went out: free its slot and send the next one.
 			uint32_t now = time_us_32();
 			dap_stats.in_us += now - t_in_start;
@@ -239,6 +368,23 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 
 		if(xferred_bytes >= 0u && xferred_bytes <= DAP_PACKET_SIZE)
 		{
+			// A full USB packet: receive the next one into the same
+			// slot, unless the request ends here.
+			out_len += xferred_bytes;
+			if(xferred_bytes == DAP_EP_SIZE && out_len < DAP_PACKET_SIZE
+			   && dap_req_len(WR_SLOT_PTR(USBRequestBuffer), out_len) > out_len)
+			{
+				dap_arm_out(rhport);
+				return true;
+			}
+			if(out_len == 0)
+			{
+				// A stray ZLP.
+				dap_arm_out(rhport);
+				return true;
+			}
+			out_len = 0;
+
 			uint32_t now = time_us_32();
 			uint32_t gap = now - t_prev_out;
 			if (gap < DAP_GAP_IDLE_US) {
@@ -259,7 +405,7 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 			// thread re-arms the endpoint when the DAP thread frees one.
 			if(!buffer_full(&USBRequestBuffer))
 			{
-				usbd_edpt_xfer(rhport, ep_addr, WR_SLOT_PTR(USBRequestBuffer), DAP_PACKET_SIZE);
+				dap_arm_out(rhport);
 			}
 			else {
 				out_stalled = true;
@@ -282,7 +428,7 @@ void dap_edpt_service(void)
 	if(out_stalled && !buffer_full(&USBRequestBuffer))
 	{
 		out_stalled = false;
-		usbd_edpt_xfer(_rhport, _out_ep_addr, WR_SLOT_PTR(USBRequestBuffer), DAP_PACKET_SIZE);
+		dap_arm_out(_rhport);
 	}
 
 	// A response is ready and the IN endpoint is idle.

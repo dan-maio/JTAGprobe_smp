@@ -57,8 +57,8 @@
 // UART0 for debugprobe debug
 // UART1 for debugprobe to target device
 
-static uint8_t TxDataBuffer[CFG_TUD_HID_EP_BUFSIZE];
-static uint8_t RxDataBuffer[CFG_TUD_HID_EP_BUFSIZE];
+static uint8_t TxDataBuffer[DAP_PACKET_SIZE];
+static uint8_t RxDataBuffer[DAP_PACKET_SIZE];
 //static uint8_t JTAGBuffer[JTAG_BUFFER_SIZE];
 
 
