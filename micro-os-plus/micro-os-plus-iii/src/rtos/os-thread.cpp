@@ -1,0 +1,2127 @@
+/*
+ * This file is part of the µOS++ project (https://micro-os-plus.github.io/).
+ * Copyright (c) 2016-2025 Liviu Ionescu. All rights reserved.
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
+ * purpose is hereby granted, under the terms of the MIT license.
+ *
+ * If a copy of the license was not distributed with this file, it can be
+ * obtained from https://opensource.org/licenses/mit.
+ */
+
+#if defined(OS_USE_OS_APP_CONFIG_H)
+#include <cmsis-plus/os-app-config.h>
+#endif
+
+#include <cmsis-plus/rtos/os.h>
+#include <cmsis-plus/diag/instrumentation.h>
+
+#include <memory>
+#include <stdexcept>
+
+#if defined(OS_USE_SMP_SCHEDULER)
+extern "C" unsigned port_cpu_id(void);
+extern "C" void port_smp_ipi(unsigned cpu) __attribute__ ((weak));
+
+extern "C" void __attribute__ ((weak))
+port_smp_ipi (unsigned cpu)
+{
+  (void) cpu;
+}
+#endif /* defined(OS_USE_SMP_SCHEDULER) */
+
+// ----------------------------------------------------------------------------
+
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wc++98-compat"
+#endif
+
+// ----------------------------------------------------------------------------
+
+namespace os
+{
+  namespace rtos
+  {
+    // ------------------------------------------------------------------------
+
+    /**
+     * @cond ignore
+     */
+
+    std::size_t thread::stack::min_size_bytes_ = port::stack::min_size_bytes;
+
+    std::size_t thread::stack::default_size_bytes_
+        = port::stack::default_size_bytes;
+
+    /**
+     * @endcond
+     */
+
+    // ------------------------------------------------------------------------
+    using mutexes_list = utils::intrusive_list<mutex, utils::double_list_links,
+                                               &mutex::owner_links_>;
+
+    // ========================================================================
+    /**
+     * @class thread::attributes
+     *
+     * @details
+     * Allow to assign custom attributes (like stack address,
+     * stack size, priority) to the thread.
+     *
+     * To simplify access, the member variables are public and do not
+     * require accessors or mutators.
+     *
+     * If the attributes are modified **after** the thread creation,
+     * the thread attributes shall not be affected.
+     *
+     * @par POSIX compatibility
+     *  Inspired by `pthread_attr_t` from
+     * [<pthread.h>](http://pubs.opengroup.org/onlinepubs/9699919799/basedefs/pthread.h.html)
+     *  (IEEE Std 1003.1, 2013 Edition).
+     */
+
+    /**
+     * @class thread::context
+     *
+     * @details
+     * The thread context includes the stack object and port
+     * specific structures.
+     *
+     * On some ports (like the Cortex-M) the thread context is
+     * stored on the stack and a pointer to the current location
+     * is kept in the context object instance.
+     *
+     * On other ports (like the synthetic POSIX port), the
+     * makecontext() functions create and manage large
+     * ucontex_t structures stored in the context object instance.
+     */
+
+    /**
+     * @class thread::stack
+     *
+     * @details
+     * This class does not contain the stack space itself, it is
+     * allocated outside, but stores the address and the size of
+     * the stack.
+     *
+     * It also manages the global variables storing the min and
+     * default stack sizes.
+     */
+
+    /**
+     * @details
+     * This variable is used by the default constructor.
+     */
+    const thread::attributes thread::initializer;
+
+    /**
+     * @class thread
+     *
+     * @details
+     * µOS++ threads are inspired by POSIX threads; they support
+     * functions that terminate and a simplified version of
+     * signals as event flags.
+     *
+     * @par Example
+     *
+     * @code{.cpp}
+     * #include <cmsis-plus/rtos/os.h>
+     * #include <cstdlib>
+     *
+     * using namespace os::rtos;
+     *
+     * // Thread function.
+     * void*
+     * func(void* args)
+     * {
+     *   // Do something.
+     *   ...
+     *   return nullptr;
+     * }
+     *
+     * int
+     * os_main(int argc, char* argv[])
+     * {
+     *   // Construct new thread, with function and no arguments.
+     *   thread th { func, nullptr };
+     *
+     *   // Do something.
+     *
+     *   // Wait for thread to terminate.
+     *   this_thread::join(th);
+     *
+     *   return 0;
+     * }
+     * @endcode
+     *
+     * @par POSIX compatibility
+     *  Inspired by `pthread_t`
+     *  from
+     * [<pthread.h>](http://pubs.opengroup.org/onlinepubs/9699919799/basedefs/pthread.h.html)
+     *  ([IEEE Std 1003.1, 2013
+     * Edition](http://pubs.opengroup.org/onlinepubs/9699919799/nframe.html)).
+     */
+
+    /**
+     * @cond ignore
+     */
+
+    void
+    thread::stack::initialize (void)
+    {
+      // Align the bottom of the stack.
+      void* pa = bottom_address_;
+      bottom_address_ = static_cast<stack::element_t*> (
+          std::align (sizeof (stack::allocation_element_t), stack::min_size (),
+                      pa, size_bytes_));
+
+      // If there is not enough space for the minimal stack, fail.
+      os_assert_throw (bottom_address_ != nullptr, ENOMEM);
+
+#pragma GCC diagnostic push
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
+#endif
+      element_t* p = bottom_address_;
+      element_t* pend = top ();
+
+      // Initialise the entire stack with the magic word.
+      for (; p < pend; ++p)
+        {
+          *p = magic;
+        }
+#pragma GCC diagnostic pop
+
+      // Compute the actual size. The -1 is to leave space for the magic.
+      size_bytes_ = ((static_cast<std::size_t> (p - bottom_address_) - 1)
+                     * sizeof (element_t));
+    }
+
+    /**
+     * @endcond
+     */
+
+    /**
+     * @details
+     * Count the number of bytes where the magic is still there.
+     *
+     * @warning: For large stacks it may be an expensive operation.
+     *
+     * @warning Cannot be invoked from Interrupt Service Routines.
+     */
+    std::size_t
+    thread::stack::available (void)
+    {
+#pragma GCC diagnostic push
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
+#endif
+      element_t* p = bottom_address_;
+      std::size_t count = 0;
+      while (*p == magic)
+        {
+          count += sizeof (element_t);
+          ++p;
+        }
+#pragma GCC diagnostic pop
+
+      return count;
+    }
+
+    /**
+     * @cond ignore
+     */
+
+    /**
+     * @details
+     * Same as in POSIX, thread functions can return, and the behaviour
+     * should be as the thread called the exit() function.
+     *
+     * This requires a proxy to run the thread function, get the result,
+     * and explicitly invoke exit().
+     */
+    void
+    thread::internal_invoke_with_exit_ (thread* thread)
+    {
+#if defined(OS_TRACE_RTOS_THREAD)
+      trace::printf ("%s() @%p %s\n", __func__, thread, thread->name ());
+#endif
+
+      void* exit_ptr;
+#if defined(__EXCEPTIONS)
+      try
+        {
+          exit_ptr = thread->func_ (thread->func_args_);
+        }
+      catch (std::exception const& e)
+        {
+          trace::printf ("%s() @%p %s top exception \"%s\"\n", __func__,
+                         thread, thread->name (), e.what ());
+          exit_ptr = nullptr;
+        }
+      catch (...)
+        {
+          trace::printf ("%s() @%p %s top exception\n", __func__, thread,
+                         thread->name ());
+          exit_ptr = nullptr;
+        }
+#else
+      exit_ptr = thread->func_ (thread->func_args_);
+#endif
+      thread->internal_exit_ (exit_ptr);
+    }
+
+    thread::thread ()
+    {
+      instrumentation::thread::create (this);
+
+#if defined(OS_TRACE_RTOS_THREAD)
+      trace::printf ("%s() @%p %s\n", __func__, this, this->name ());
+#endif
+      // Must be explicit here, since they are not done in the members
+      // declarations to allow th_enable_assert_reuse.
+      state_ = state::initializing;
+#if defined(OS_USE_SMP_SCHEDULER)
+      cpu_affinity_ = 0xFFFFFFFFu;
+#endif /* defined(OS_USE_SMP_SCHEDULER) */
+
+      instrumentation::thread::create_return (this);
+    }
+
+    thread::thread (const char* name) : object_named_system{ name }
+    {
+      instrumentation::thread::create (this);
+
+#if defined(OS_TRACE_RTOS_THREAD)
+      trace::printf ("%s() @%p %s\n", __func__, this, this->name ());
+#endif
+      // Must be explicit here, since they are not done in the members
+      // declarations to allow th_enable_assert_reuse.
+      state_ = state::initializing;
+#if defined(OS_USE_SMP_SCHEDULER)
+      cpu_affinity_ = 0xFFFFFFFFu;
+#endif /* defined(OS_USE_SMP_SCHEDULER) */
+
+      instrumentation::thread::create_return (this);
+    }
+
+    /**
+     * @endcond
+     */
+
+    /**
+     * @details
+     * Check the thread status to determine if the thread is already in
+     * a constructed state, which means it was constructed and not yet
+     * destructed.
+     * This is useful for threads constructed via the C API or
+     * in C++ via placement new,
+     * to avoid constructing them when already constructed.
+     *
+     * @note For this function to be accurate before the first invocation,
+     * it is necessary for the thread to start with the memory cleared,
+     * for example via a `memset()`.
+     *
+     * @todo Consider adding a separate member with the magic,
+     * for improved reliability.
+     *
+     * @note Can be invoked from Interrupt Service Routines.
+     */
+    bool
+    thread::is_constructed (const thread& thread)
+    {
+      return ((thread.state_ == state::ready || thread.state_ == state::running
+               || thread.state_ == state::suspended
+               || thread.state_ == state::terminated));
+    }
+
+    /**
+     * @details
+     * This constructor shall initialise a thread object
+     * with attributes referenced by _attr_.
+     * If the attributes specified by _attr_ are modified later,
+     * the thread attributes shall not be affected.
+     * Upon successful initialisation, the state of the
+     * thread object shall become initialised, and the thread is
+     * added to the ready list.
+     *
+     * Only the thread object itself may be used for running the
+     * function. It is not allowed to make copies of
+     * thread objects.
+     *
+     * In cases where default thread attributes are
+     * appropriate, the variable `thread::initializer` can be used to
+     * initialise threads.
+     * The effect shall be equivalent to creating a thread
+     * object with the default constructor.
+     *
+     * The thread is created to execute _function_ with _args_ as its
+     * sole argument. If the function returns, the effect
+     * shall be as if there was an implicit call to `exit()` using
+     * the return value of function as the exit code. Note that
+     * the thread in which `main()` was originally invoked differs
+     * from this. When it returns from `main()`, the effect shall
+     * be as if there was an implicit call to `exit()` using the
+     * return value of `main()` as the exit code.
+     *
+     * If the attributes define a stack area (via `th_stack_address` and
+     * `th_stack_size_bytes`), that stack is used, otherwise
+     * the stack is dynamically allocated using the RTOS specific allocator
+     * (`rtos::memory::allocator`).
+     *
+     * If the _attr_ attributes are modified **after** the thread creation,
+     * the thread attributes shall not be affected.
+     *
+     * @par POSIX compatibility
+     *  Inspired by
+     * [`pthread_create()`](http://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_create.html)
+     *  from
+     * [`<pthread.h>`](http://pubs.opengroup.org/onlinepubs/9699919799/basedefs/pthread.h.html)
+     *  ([IEEE Std 1003.1, 2013
+     * Edition](http://pubs.opengroup.org/onlinepubs/9699919799/nframe.html)).
+     *
+     * @warning Cannot be invoked from Interrupt Service Routines.
+     */
+    thread::thread (func_t function, func_args_t args, const attributes& attr,
+                    const allocator_type& allocator)
+        : thread{ nullptr, function, args, attr, allocator }
+    {
+    }
+
+    /**
+     * @details
+     * This constructor shall initialise a named thread object
+     * with attributes referenced by _attr_.
+     * If the attributes specified by _attr_ are modified later,
+     * the thread attributes shall not be affected.
+     * Upon successful initialisation, the state of the
+     * thread object shall become initialised, and the thread is
+     * added to the ready list.
+     *
+     * Only the thread object itself may be used for running the
+     * function. It is not allowed to make copies of
+     * thread objects.
+     *
+     * In cases where default thread attributes are
+     * appropriate, the variable `thread::initializer` can be used to
+     * initialise threads.
+     * The effect shall be equivalent to creating a thread
+     * object with the default constructor.
+     *
+     * The thread is created to execute _function_ with _args_ as its
+     * sole argument. If the function returns, the effect
+     * shall be as if there was an implicit call to `exit()` using
+     * the return value of function as the exit code. Note that
+     * the thread in which `main()` was originally invoked differs
+     * from this. When it returns from `main()`, the effect shall
+     * be as if there was an implicit call to `exit()` using the
+     * return value of `main()` as the exit code.
+     *
+     * If the attributes define a stack area (via `th_stack_address` and
+     * `th_stack_size_bytes`), that stack is used, otherwise
+     * the stack is dynamically allocated using the RTOS specific allocator
+     * (`rtos::memory::allocator`).
+     *
+     * If the _attr_ attributes are modified **after** the thread creation,
+     * the thread attributes shall not be affected.
+     *
+     * @par POSIX compatibility
+     *  Inspired by
+     * [`pthread_create()`](http://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_create.html)
+     *  from
+     * [`<pthread.h>`](http://pubs.opengroup.org/onlinepubs/9699919799/basedefs/pthread.h.html)
+     *  ([IEEE Std 1003.1, 2013
+     * Edition](http://pubs.opengroup.org/onlinepubs/9699919799/nframe.html)).
+     *
+     * @warning Cannot be invoked from Interrupt Service Routines.
+     */
+    thread::thread (const char* name, func_t function, func_args_t args,
+                    const attributes& attr, const allocator_type& allocator)
+        : object_named_system{ name }
+    {
+      instrumentation::thread::create (this);
+
+#if defined(OS_TRACE_RTOS_THREAD)
+      trace::printf ("%s() @%p %s\n", __func__, this, this->name ());
+#endif
+
+#if defined(DEBUG)
+      if (attr.th_enable_assert_reuse)
+        {
+          // Expect either statically initialised (undefined), or destroyed.
+          assert ((state_ == state::undefined)
+                  || (state_ == state::destroyed));
+        }
+#endif /* DEBUG */
+
+      state_ = state::initializing;
+#if defined(OS_USE_SMP_SCHEDULER)
+      cpu_affinity_ = attr.th_cpu_affinity;
+#endif /* defined(OS_USE_SMP_SCHEDULER) */
+
+      allocator_ = &allocator;
+
+      if (attr.th_stack_address != nullptr
+          && attr.th_stack_size_bytes > stack::min_size ())
+        {
+          internal_construct_ (function, args, attr, nullptr, 0);
+        }
+      else
+        {
+          using allocator_type2
+              = memory::allocator<stack::allocation_element_t>;
+
+          if (attr.th_stack_size_bytes > stack::min_size ())
+            {
+              allocated_stack_size_elements_
+                  = (attr.th_stack_size_bytes
+                     + sizeof (stack::allocation_element_t) - 1)
+                    / sizeof (stack::allocation_element_t);
+            }
+          else
+            {
+              allocated_stack_size_elements_
+                  = (stack::default_size ()
+                     + sizeof (stack::allocation_element_t) - 1)
+                    / sizeof (stack::allocation_element_t);
+            }
+
+#pragma GCC diagnostic push
+#if defined(__clang__)
+#elif defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Wuseless-cast"
+#endif
+          allocated_stack_address_ = reinterpret_cast<stack::element_t*> (
+              const_cast<allocator_type2&> (allocator).allocate (
+                  allocated_stack_size_elements_));
+#pragma GCC diagnostic pop
+
+          // Stack allocation failed.
+          assert (allocated_stack_address_ != nullptr);
+
+          internal_construct_ (function, args, attr, allocated_stack_address_,
+                               allocated_stack_size_elements_
+                                   * sizeof (stack::allocation_element_t));
+        }
+
+      instrumentation::thread::create_return (this);
+    }
+
+    /**
+     * @cond ignore
+     */
+
+    void
+    thread::internal_construct_ (func_t function, func_args_t args,
+                                 const attributes& attr, void* stack_address,
+                                 std::size_t stack_size_bytes)
+    {
+      using namespace os;
+
+      // Don't call this from interrupt handlers.
+      os_assert_throw (!interrupts::in_handler_mode (), EPERM);
+
+      // The thread function must be real.
+      assert (function != nullptr);
+      // Don't forget to set the thread priority.
+      assert (attr.th_priority != priority::none);
+
+      clock_ = attr.clock != nullptr ? attr.clock : &sysclock;
+
+      if (stack_address != nullptr)
+        {
+          // The attributes should not define any storage in this case.
+          if (attr.th_stack_size_bytes > stack::min_size ())
+            {
+              // The stack address must be real.
+              assert (attr.th_stack_address == nullptr);
+            }
+
+          stack ().set (static_cast<stack::element_t*> (stack_address),
+                        stack_size_bytes);
+        }
+      else
+        {
+          stack ().set (static_cast<stack::element_t*> (attr.th_stack_address),
+                        attr.th_stack_size_bytes);
+        }
+
+#if defined(OS_TRACE_RTOS_THREAD)
+      trace::printf ("%s() @%p %s p%u stack{%p,%u}\n", __func__, this, name (),
+                     attr.th_priority, stack ().bottom_address_,
+                     stack ().size_bytes_);
+#endif
+
+      {
+        // Prevent the new thread to execute before all members are set.
+        // ----- Enter critical section ---------------------------------------
+        scheduler::critical_section scs;
+
+        // Get attributes from user structure.
+        prio_assigned_ = attr.th_priority;
+
+        func_ = function;
+        func_args_ = args;
+
+        parent_ = this_thread::_thread ();
+        if (scheduler::started () && (parent_ != nullptr))
+          {
+            parent_->children_.link (*this);
+          }
+        else
+          {
+            scheduler::top_threads_list_.link (*this);
+          }
+
+        stack ().initialize ();
+
+        instrumentation::thread::created (this);
+
+#if defined(OS_USE_RTOS_PORT_SCHEDULER)
+
+        port::thread::create (this);
+        state_ = state::ready;
+
+#else
+
+#pragma GCC diagnostic push
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wc++98-compat-pedantic"
+#endif
+        // Create the port specific context.
+        port::context::create (
+            &context_, reinterpret_cast<void*> (internal_invoke_with_exit_),
+            this);
+#pragma GCC diagnostic pop
+
+        if (!scheduler::started ())
+          {
+#if defined(OS_USE_SMP_SCHEDULER)
+            scheduler::current_thread_[port_cpu_id()] = this;
+#else
+            scheduler::current_thread_ = this;
+#endif /* defined(OS_USE_SMP_SCHEDULER) */
+          }
+
+        // Add to ready list, but do not yield yet.
+        resume ();
+
+#endif
+        // ----- Exit critical section ----------------------------------------
+      }
+      // For just in case the new thread has higher priority.
+      this_thread::yield ();
+    }
+
+    /**
+     * @endcond
+     */
+
+    /**
+     * @details
+     * This destructor shall destroy the thread object; the object
+     * becomes, in effect, uninitialised. An implementation may cause
+     * the destructor to set the object to an invalid value.
+     *
+     * If the stack was dynamically allocated, it is deallocated
+     * using the same allocator.
+     *
+     * @par POSIX compatibility
+     *  No POSIX similar functionality identified.
+     *
+     * @warning Cannot be invoked from Interrupt Service Routines.
+     */
+    thread::~thread ()
+    {
+      instrumentation::thread::destroy (this);
+
+#if defined(OS_TRACE_RTOS_THREAD)
+      trace::printf ("%s() @%p %s \n", __func__, this, name ());
+#endif
+
+      // Prevent the main thread to destroy itself while running
+      // the exit cleanup code.
+      if (this != &this_thread::thread ())
+        {
+          // Extra test to avoid the 'already gone' message.
+          if (state_ != state::destroyed)
+            {
+              kill ();
+            }
+        }
+      else
+        {
+#if defined(OS_TRACE_RTOS_THREAD)
+          trace::printf ("%s() @%p %s nop, cannot commit suicide\n", __func__,
+                         this, name ());
+#endif
+        }
+
+      instrumentation::thread::destroy_return (this);
+    }
+
+    /**
+     * @details
+     * Internal, used in the implementation of synchronisation objects.
+     *
+     * @par POSIX compatibility
+     *  Extension to standard, no POSIX similar functionality identified.
+     *
+     * @note Can be invoked from Interrupt Service Routines.
+     */
+    void
+    thread::resume (void)
+    {
+      instrumentation::thread::resume (this);
+
+      using namespace os;
+
+#if defined(OS_TRACE_RTOS_THREAD_CONTEXT)
+      trace::printf ("%s() @%p %s %u\n", __func__, this, name (),
+                     prio_assigned_);
+#endif
+
+#if defined(OS_USE_RTOS_PORT_SCHEDULER)
+
+      {
+        // ----- Enter critical section ---------------------------------------
+        interrupts::critical_section ics;
+
+        state_ = state::ready;
+        port::thread::resume (this);
+        // ----- Exit critical section ----------------------------------------
+      }
+
+#else
+
+      // Don't call this from high priority interrupts.
+      assert (port::interrupts::is_priority_valid ());
+
+      {
+        // ----- Enter critical section ---------------------------------------
+        interrupts::critical_section ics;
+
+        // If the thread is not already in the ready list, enqueue it.
+        // In SMP, a running thread has ready_node_.next() == nullptr;
+        // it must not be re-enqueued while actively executing.
+        if (state_ == state::suspended || state_ == state::initializing)
+          {
+            if (ready_node_.next () == nullptr)
+              {
+                scheduler::ready_threads_list_.link (ready_node_);
+                // state::ready set in above link().
+              }
+          }
+        // ----- Exit critical section ----------------------------------------
+      }
+
+      instrumentation::thread::ready (this);
+
+      port::scheduler::reschedule ();
+
+#if defined(OS_INTEGER_RTOS_PORT_NCPU) && (OS_INTEGER_RTOS_PORT_NCPU > 1)
+      // If the waking CPU is not in this thread's affinity mask,
+      // actively trigger a reschedule IPI to an eligible core so it
+      // doesn't wait up to 1 ms for its next local clock tick.
+      unsigned this_cpu = port_cpu_id ();
+      if ((cpu_affinity () & (1u << this_cpu)) == 0)
+        {
+          for (unsigned c = 0; c < OS_NCPU; ++c)
+            {
+              if (c != this_cpu && (cpu_affinity () & (1u << c)) != 0)
+                {
+                  port_smp_ipi (c);
+                  break;
+                }
+            }
+        }
+#endif
+
+#endif
+
+      instrumentation::thread::resume_return (this);
+    }
+
+    /**
+     * @par POSIX compatibility
+     *  Extension to standard, no POSIX similar functionality identified.
+     *
+     * @note Can be invoked from Interrupt Service Routines.
+     */
+#if defined(OS_USE_SMP_SCHEDULER)
+    uint32_t
+    thread::cpu_affinity (void) const
+    {
+      return cpu_affinity_;
+    }
+
+    void
+    thread::cpu_affinity (uint32_t mask)
+    {
+      cpu_affinity_ = mask;
+    }
+#endif /* defined(OS_USE_SMP_SCHEDULER) */
+
+    thread::priority_t
+    thread::priority (void)
+    {
+      // trace::printf ("%s() @%p %s\n", __func__, this, name ());
+
+      if (prio_inherited_ == priority::none)
+        {
+          // The common case is to have no inherited priority;
+          // return the assigned one.
+          return prio_assigned_;
+        }
+      else
+        {
+          // Return the maximum between inherited and assigned.
+          return (prio_inherited_ >= prio_assigned_) ? prio_inherited_
+                                                     : prio_assigned_;
+        }
+    }
+
+    /**
+     * @par POSIX compatibility
+     *  Extension to standard, no POSIX similar functionality identified.
+     *
+     * @warning Cannot be invoked from Interrupt Service Routines.
+     */
+    thread::priority_t
+    thread::priority_inherited (void)
+    {
+      // Don't call this from interrupt handlers.
+      os_assert_err (!interrupts::in_handler_mode (), priority::error);
+
+      return prio_inherited_;
+    }
+
+    /**
+     * @details
+     * Set the scheduling priority for the thread to the value given
+     * by _prio_.
+     *
+     * If an implementation detects use of a thread ID after the end
+     * of its lifetime, it is recommended that the function should
+     * fail and report an `ESRCH` error.
+     *
+     * The `priority()` function shall not return an error
+     * code of `EINTR`.
+     *
+     * @par POSIX compatibility
+     *  Inspired by
+     * [`pthread_setschedprio()`](http://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_setschedprio.html)
+     *  from
+     * [`<pthread.h>`](http://pubs.opengroup.org/onlinepubs/9699919799/basedefs/pthread.h.html)
+     *  ([IEEE Std 1003.1, 2013
+     * Edition](http://pubs.opengroup.org/onlinepubs/9699919799/nframe.html)).
+     *
+     * @warning Cannot be invoked from Interrupt Service Routines.
+     */
+    result_t
+    thread::priority (priority_t prio)
+    {
+      instrumentation::thread::priority_set (this, prio);
+
+#if defined(OS_TRACE_RTOS_THREAD)
+      trace::printf ("%s(%u) @%p %s\n", __func__, prio, this, name ());
+#endif
+
+      // Don't call this from interrupt handlers.
+      os_assert_err (!interrupts::in_handler_mode (), EPERM);
+      // Check the priority, it is not in the allowed range.
+      os_assert_err (prio < priority::error, EINVAL);
+      os_assert_err (prio != priority::none, EINVAL);
+
+      if (prio_assigned_ == prio)
+        {
+          // Optimise, if priority did not change.
+          instrumentation::thread::priority_set_retval (this, result::ok);
+          return result::ok;
+        }
+
+      prio_assigned_ = prio;
+
+      result_t res = result::ok;
+
+#if defined(OS_USE_RTOS_PORT_SCHEDULER)
+
+      // The port must perform a context switch.
+      res = port::thread::priority (this, prio);
+
+#else
+
+      {
+        // ----- Enter critical section ---------------------------------------
+        interrupts::critical_section ics;
+
+        // Test and relink under one lock, and only a thread that is still
+        // linked in the ready list. On SMP another CPU may pick this thread
+        // between a test made outside the lock and the relink: link() would
+        // then put a thread being dispatched back in the ready list, marked
+        // ready, and a third CPU could run the same context at once.
+        if (state_ == state::ready && ready_node_.next () != nullptr)
+          {
+            // Remove from initial location and reinsert according
+            // to new priority.
+            ready_node_.unlink ();
+            scheduler::ready_threads_list_.link (ready_node_);
+          }
+        // ----- Exit critical section ----------------------------------------
+      }
+
+      // Mandatory, the priority might have been raised, the
+      // task must be scheduled to run.
+      this_thread::yield ();
+
+#endif
+
+      instrumentation::thread::priority_set_retval (this, res);
+      return res;
+    }
+
+    /**
+     * @details
+     * Set the scheduling inherited priority for the thread to the value given
+     * by _prio_.
+     *
+     * If an implementation detects use of a thread ID after the end
+     * of its lifetime, it is recommended that the function should
+     * fail and report an `ESRCH` error.
+     *
+     * The `priority_inherited()` function shall not return an error
+     * code of `EINTR`.
+     *
+     * @par POSIX compatibility
+     *  Extension to standard, no POSIX similar functionality identified.
+     *
+     * @warning Cannot be invoked from Interrupt Service Routines.
+     */
+    result_t
+    thread::priority_inherited (priority_t prio)
+    {
+      instrumentation::thread::priority_inherited_set (this, prio);
+
+#if defined(OS_TRACE_RTOS_THREAD)
+      trace::printf ("%s(%u) @%p %s\n", __func__, prio, this, name ());
+#endif
+
+      // Don't call this from interrupt handlers.
+      os_assert_err (!interrupts::in_handler_mode (), EPERM);
+      // Check the priority, it is not in the allowed range.
+      os_assert_err (prio < priority::error, EINVAL);
+
+      // Warning: do not check for `priority::none`, since
+      // `mutex::unlock()` sets it when the list of mutexes owned
+      // by a thread is empty.
+
+      if (prio == prio_inherited_)
+        {
+          // Optimise, if priority did not change.
+          instrumentation::thread::priority_inherited_set_retval (this,
+                                                                  result::ok);
+          return result::ok;
+        }
+
+      prio_inherited_ = prio;
+
+      if (prio_inherited_ < prio_assigned_)
+        {
+          // Optimise, no need to reschedule.
+          instrumentation::thread::priority_inherited_set_retval (this,
+                                                                  result::ok);
+          return result::ok;
+        }
+
+      result_t res = result::ok;
+
+#if defined(OS_USE_RTOS_PORT_SCHEDULER)
+
+      // The port must perform a context switch.
+      res = port::thread::priority (this, prio);
+
+#else
+
+      {
+        // ----- Enter critical section ---------------------------------------
+        interrupts::critical_section ics;
+
+        // Test and relink under one lock, and only a thread that is still
+        // linked in the ready list. On SMP another CPU may pick this thread
+        // between a test made outside the lock and the relink: link() would
+        // then put a thread being dispatched back in the ready list, marked
+        // ready, and a third CPU could run the same context at once.
+        if (state_ == state::ready && ready_node_.next () != nullptr)
+          {
+            // Remove from initial location and reinsert according
+            // to new priority.
+            ready_node_.unlink ();
+            scheduler::ready_threads_list_.link (ready_node_);
+          }
+        // ----- Exit critical section ----------------------------------------
+      }
+
+      // Mandatory, the priority might have been raised, the
+      // task must be scheduled to run.
+      this_thread::yield ();
+
+#endif
+
+      instrumentation::thread::priority_inherited_set_retval (this, res);
+      return res;
+    }
+
+    /**
+     * @details
+     * Indicate to the implementation that storage for the thread
+     * thread can be reclaimed when that thread terminates. If
+     * thread has not terminated, `detach()` shall not cause it
+     * to terminate. The behaviour is undefined if the value
+     * specified by the thread argument to `detach()` does not
+     * refer to a joinable thread.
+     *
+     * @par POSIX compatibility
+     *  Inspired by
+     * [`pthread_detach()`](http://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_detach.html)
+     *  from
+     * [`<pthread.h>`](http://pubs.opengroup.org/onlinepubs/9699919799/basedefs/pthread.h.html)
+     *  ([IEEE Std 1003.1, 2013
+     * Edition](http://pubs.opengroup.org/onlinepubs/9699919799/nframe.html)).
+     *
+     * The `detach()` function shall not return an error code of `EINTR`.
+     *
+     * @warning Cannot be invoked from Interrupt Service Routines.
+     */
+    result_t
+    thread::detach (void)
+    {
+      instrumentation::thread::detach (this);
+
+#if defined(OS_TRACE_RTOS_THREAD)
+      trace::printf ("%s() @%p %s\n", __func__, this, name ());
+#endif
+
+      // Don't call this from interrupt handlers.
+      os_assert_err (!interrupts::in_handler_mode (), EPERM);
+
+#if defined(OS_USE_RTOS_PORT_SCHEDULER)
+
+      result_t res = port::thread::detach (this);
+      if (res != result::ok)
+        {
+          instrumentation::thread::detach_retval (this, res);
+          return res;
+        }
+
+#else
+
+      {
+        interrupts::critical_section ics;
+
+        if (state_ == state::destroyed)
+          {
+            instrumentation::thread::detach_retval (this, EINVAL);
+            return EINVAL;
+          }
+
+        if (parent_ != nullptr)
+          {
+            child_links_.unlink ();
+            scheduler::top_threads_list_.link (*this);
+            parent_ = nullptr;
+          }
+      }
+
+#endif
+
+      instrumentation::thread::detach_retval (this, result::ok);
+      return result::ok;
+    }
+
+    /**
+     * @details
+     * Suspend execution of the calling thread until the target thread
+     * terminates, unless the target thread has already terminated.
+     * On return from a successful `join()` call with a non-NULL
+     * _exit_ptr_ argument, the value passed to `exit()` by the
+     * terminating thread shall be made available in the location
+     * referenced by _exit_ptr_. When a `join()` returns successfully,
+     * the target thread has been terminated. The results of
+     * multiple simultaneous calls to `join()` specifying the
+     * same target thread are undefined. If the thread calling
+     * `join()` is cancelled, then the target thread shall not be
+     * detached.
+     *
+     * @par POSIX compatibility
+     *  Inspired by
+     * [`pthread_join()`](http://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_join.html)
+     *  from
+     * [`<pthread.h>`](http://pubs.opengroup.org/onlinepubs/9699919799/basedefs/pthread.h.html)
+     *  ([IEEE Std 1003.1, 2013
+     * Edition](http://pubs.opengroup.org/onlinepubs/9699919799/nframe.html)).
+     *
+     *
+     * The join() function may fail if:
+     * [EDEADLK] A deadlock was detected.
+     *
+     * The `join()` function shall not return an error code of [EINTR].
+     *
+     * @warning Cannot be invoked from Interrupt Service Routines.
+     */
+
+    result_t
+    thread::join (void** exit_ptr)
+    {
+      instrumentation::thread::join (this);
+
+#if defined(OS_TRACE_RTOS_THREAD)
+      trace::printf ("%s() @%p %s\n", __func__, this, name ());
+#endif
+
+      // Don't call this from interrupt handlers.
+      os_assert_err (!interrupts::in_handler_mode (), EPERM);
+      // Don't call this from critical regions.
+      os_assert_err (!scheduler::locked (), EPERM);
+
+      // Fail if current thread
+      assert (this != this_thread::_thread ());
+
+      thread* crt_thread = this_thread::_thread ();
+      for (;;)
+        {
+          {
+            // ----- Enter critical section -----------------------------------
+            interrupts::critical_section ics;
+
+            // Test, register and suspend under one lock, the same lock
+            // internal_destroy_() sets `destroyed` and reads `joiner_`
+            // under. Done in steps, a destroy on another CPU could fall
+            // between them and its wake-up be lost.
+            if (state_ == state::destroyed)
+              {
+                break;
+              }
+            joiner_ = crt_thread;
+
+            // Remove this thread from the ready list, if there.
+            port::this_thread::prepare_suspend ();
+
+            crt_thread->state_ = state::suspended;
+            // ----- Exit critical section ------------------------------------
+          }
+
+          instrumentation::thread::suspended (
+              crt_thread, OS_INTEGER_INSTRUMENTATION_SUSPEND_CAUSE_JOIN);
+
+          port::scheduler::reschedule ();
+        }
+
+#if defined(OS_USE_SMP_SCHEDULER)
+      // On SMP, the joined thread may still be running on another CPU
+      // completing its final reschedule() context switch. Wait until it is
+      // no longer current on any CPU before returning, so the caller can
+      // safely reclaim the thread object and stack memory.
+      for (;;)
+        {
+          bool still_running = false;
+          for (unsigned c = 0; c < OS_NCPU; ++c)
+            {
+              if (__atomic_load_n (&scheduler::current_thread_[c],
+                                   __ATOMIC_ACQUIRE) == this)
+                {
+                  still_running = true;
+                  break;
+                }
+            }
+          if (!still_running)
+            {
+              break;
+            }
+          this_thread::yield ();
+        }
+#endif
+
+#if defined(OS_TRACE_RTOS_THREAD)
+      trace::printf ("%s() @%p %s joined\n", __func__, this, name ());
+#endif
+
+      if (exit_ptr != nullptr)
+        {
+          *exit_ptr = func_result_;
+        }
+
+      instrumentation::thread::join_retval (this, result::ok);
+      return result::ok;
+    }
+
+    /**
+     * @details
+     * The `cancel()` function shall not return an error code of `EINTR`.
+     * If an implementation detects use of a thread ID after the end
+     * of its lifetime, it is recommended that the function should
+     * fail and report an `ESRCH` error.
+     * error number is returned.
+     *
+     * @todo Implement it properly (thread interruption is not yet
+     * fully implemented).
+     *
+     * @par POSIX compatibility
+     *  Inspired by
+     * [`pthread_cancel()`](http://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_cancel.html)
+     *  from
+     * [`<pthread.h>`](http://pubs.opengroup.org/onlinepubs/9699919799/basedefs/pthread.h.html)
+     *  ([IEEE Std 1003.1, 2013
+     * Edition](http://pubs.opengroup.org/onlinepubs/9699919799/nframe.html)).
+     *
+     * @warning Cannot be invoked from Interrupt Service Routines.
+     */
+    result_t
+    thread::cancel (void)
+    {
+      instrumentation::thread::cancel (this);
+
+#if defined(OS_TRACE_RTOS_THREAD)
+      trace::printf ("%s() @%p %s\n", __func__, this, name ());
+#endif
+
+      // Don't call this from interrupt handlers.
+      os_assert_err (!interrupts::in_handler_mode (), EPERM);
+
+      // TODO: implement according to POSIX specs.
+      instrumentation::thread::cancel_retval (this, result::ok);
+      return result::ok;
+    }
+
+    /**
+     * @details
+     * If the interrupt flag is true, threads waiting for
+     * an event are notified immediately (actually as
+     * soon as the thread priority allows it to run).
+     *
+     * After the thread detects the interrupted condition, it
+     * must clear the interrupted flag.
+     *
+     * @warning Cannot be invoked from Interrupt Service Routines.
+     */
+    bool
+    thread::interrupt (bool interrupt)
+    {
+      instrumentation::thread::interrupt (this);
+
+#if defined(OS_TRACE_RTOS_THREAD)
+      trace::printf ("%s() @%p %s\n", __func__, this, name ());
+#endif
+
+      bool tmp = interrupted_;
+      interrupted_ = interrupt;
+
+      resume ();
+
+      instrumentation::thread::interrupt_retval (this, tmp);
+      return tmp;
+    }
+
+    /**
+     * @cond ignore
+     */
+
+    /**
+     * @par POSIX compatibility
+     *  Extension to standard, no POSIX similar functionality identified.
+     */
+    void
+    thread::internal_suspend_ (unsigned int cause)
+    {
+      using namespace os;
+
+#if defined(OS_TRACE_RTOS_THREAD)
+      trace::printf ("%s() @%p %s\n", __func__, this, name ());
+#endif
+
+      {
+        // ----- Enter critical section ---------------------------------------
+        interrupts::critical_section ics;
+
+        // Remove this thread from the ready list, if there.
+        port::this_thread::prepare_suspend ();
+
+        state_ = state::suspended;
+        // ----- Exit critical section ----------------------------------------
+      }
+
+      instrumentation::thread::suspended (this, cause);
+
+      port::scheduler::reschedule ();
+    }
+
+    void
+    thread::internal_exit_ (void* exit_ptr)
+    {
+      using namespace os;
+
+      instrumentation::thread::internal_exit (this, exit_ptr);
+
+#if defined(OS_TRACE_RTOS_THREAD)
+      trace::printf ("%s() @%p %s\n", __func__, this, name ());
+#endif
+
+      // Don't call this from interrupt handlers.
+      assert (!interrupts::in_handler_mode ());
+
+      {
+        // ----- Enter critical section ---------------------------------------
+        scheduler::critical_section scs;
+
+        {
+          // ----- Enter critical section -------------------------------------
+          interrupts::critical_section ics;
+
+          ready_node_.unlink ();
+
+          child_links_.unlink ();
+          // ----- Exit critical section --------------------------------------
+        }
+
+        // There must be no children threads still alive.
+        assert (children_.empty ());
+        parent_ = nullptr;
+
+        func_ = nullptr;
+        func_args_ = nullptr;
+
+        // There must be no more mutexes locked by this thread.
+        assert (mutexes_.empty ());
+        assert (acquired_mutexes_ == 0);
+
+        func_result_ = exit_ptr;
+        // ----- Exit critical section ----------------------------------------
+      }
+
+      {
+        // ----- Enter critical section ---------------------------------------
+        interrupts::critical_section ics;
+
+        // Add to a list of threads to be destroyed by the idle thread.
+        // Also set state::terminated.
+        scheduler::terminated_threads_list_.link (ready_node_);
+        // ----- Exit critical section ----------------------------------------
+      }
+
+      instrumentation::thread::internal_exit_return (this);
+      instrumentation::thread::terminated (this);
+
+#if defined(OS_USE_RTOS_PORT_SCHEDULER)
+
+      port::thread::destroy_this (this);
+      // Does not return if the current thread.
+
+#else
+
+      // At this point, since the thread state is no longer 'running',
+      // the thread is no longer linked in the READY list.
+      port::scheduler::reschedule ();
+
+#endif
+
+      assert (true);
+      while (true)
+        ;
+
+      // Definitely does not return.
+    }
+
+    void
+    thread::internal_check_stack_ (void)
+    {
+      if (stack ().size () > 0)
+        {
+          if (!stack ().check_bottom_magic () || !stack ().check_top_magic ())
+            {
+              trace::printf ("%s() @%p %s\n", __func__, this, name ());
+              assert (stack ().check_bottom_magic ());
+              assert (stack ().check_top_magic ());
+            }
+
+#if defined(OS_TRACE_RTOS_THREAD)
+          trace::printf (
+              "%s() @%p %s stack: %u/%u bytes used\n", __func__, this, name (),
+              stack ().size () - stack ().available (), stack ().size ());
+#endif
+
+          // Clear stack to avoid further checks
+          stack ().clear ();
+        }
+    }
+
+#pragma GCC diagnostic push
+#if defined(__clang__)
+#elif defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Wsuggest-final-methods"
+#endif
+    // Called from kill() and from idle thread.
+    void
+    thread::internal_destroy_ (void)
+    {
+#if defined(OS_TRACE_RTOS_THREAD)
+      trace::printf ("%s() @%p %s\n", __func__, this, name ());
+#endif
+
+      internal_check_stack_ ();
+
+      if (allocated_stack_address_ != nullptr)
+        {
+          typedef
+              typename std::allocator_traits<allocator_type>::pointer pointer;
+
+#pragma GCC diagnostic push
+#if defined(__clang__)
+#elif defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Wuseless-cast"
+#pragma GCC diagnostic ignored "-Wcast-align"
+#endif
+          static_cast<allocator_type*> (const_cast<void*> (allocator_))
+              ->deallocate (
+                  reinterpret_cast<pointer> (allocated_stack_address_),
+                  allocated_stack_size_elements_);
+#pragma GCC diagnostic pop
+
+          allocated_stack_address_ = nullptr;
+        }
+
+      {
+        // ----- Enter critical section ---------------------------------------
+        scheduler::critical_section scs;
+
+        mutexes_list& mx_list = reinterpret_cast<mutexes_list&> (mutexes_);
+        while (not mx_list.empty ())
+          {
+            auto* mx = mx_list.unlink_head ();
+
+            mx->internal_mark_owner_dead_ ();
+
+            // Unlock the mutex as owned by the thread itself.
+            mx->internal_unlock_ (this);
+          }
+        // ----- Exit critical section ----------------------------------------
+      }
+
+      {
+        // ----- Enter critical section ---------------------------------------
+        interrupts::critical_section ics;
+
+        // From `destroyed` on, a joiner may return from join() and free
+        // this object, so `joiner_` is read under the same lock that
+        // sets it, and the joiner is made ready here, where it cannot
+        // yet have gone -- resume() would do it after the lock.
+        state_ = state::destroyed;
+
+        thread* joiner = joiner_;
+        if (joiner != nullptr && joiner->state_ == state::suspended
+            && joiner->ready_node_.next () == nullptr)
+          {
+            scheduler::ready_threads_list_.link (joiner->ready_node_);
+            // state::ready set in above link().
+          }
+        // ----- Exit critical section ----------------------------------------
+      }
+
+      port::scheduler::reschedule ();
+    }
+#pragma GCC diagnostic pop
+
+    /**
+     * @endcond
+     */
+
+    /**
+     * @par POSIX compatibility
+     *  Inspired by
+     * [`pthread_kill()`](http://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_kill.html)
+     *  from
+     * [`<pthread.h>`](http://pubs.opengroup.org/onlinepubs/9699919799/basedefs/pthread.h.html)
+     *  ([IEEE Std 1003.1, 2013
+     * Edition](http://pubs.opengroup.org/onlinepubs/9699919799/nframe.html)).
+     *
+     * @warning Cannot be invoked from Interrupt Service Routines.
+     */
+    result_t
+    thread::kill (void)
+    {
+      instrumentation::thread::kill (this);
+
+#if defined(OS_TRACE_RTOS_THREAD)
+      trace::printf ("%s() @%p %s\n", __func__, this, name ());
+#endif
+
+      // Don't call this from interrupt handlers.
+      os_assert_err (!interrupts::in_handler_mode (), EPERM);
+
+      {
+        // ----- Enter critical section ---------------------------------------
+        scheduler::critical_section scs;
+
+#if defined(OS_USE_SMP_SCHEDULER)
+        // On SMP the thread may be running on another CPU -- typically
+        // still inside its own internal_exit_(), right after the event that
+        // let this caller go on -- or be terminated and already taken off
+        // the funeral list by an idle reaper, which destroys it outside the
+        // lock. Destroying it here in either case frees the stack another
+        // CPU runs on, or destroys it twice. So wait, with the lock
+        // released, until it is off every CPU and unclaimed; from then on
+        // the lock held keeps it so.
+        for (;;)
+          {
+            if (__atomic_load_n (&state_, __ATOMIC_ACQUIRE) == state::destroyed)
+              {
+                break;
+              }
+
+            bool busy = (__atomic_load_n (&context_.port_.stack_ptr,
+                                          __ATOMIC_ACQUIRE)
+                         == nullptr);
+            unsigned busy_cpu = OS_NCPU;
+            for (unsigned c = 0; c < OS_NCPU; ++c)
+              {
+                if (__atomic_load_n (&scheduler::current_thread_[c],
+                                     __ATOMIC_ACQUIRE)
+                    == this)
+                  {
+                    busy = true;
+                    busy_cpu = c;
+                    break;
+                  }
+              }
+
+            thread::state_t st = __atomic_load_n (&state_, __ATOMIC_ACQUIRE);
+            if (st == state::destroying)
+              {
+                busy = true;
+              }
+            else if (st == state::terminated && ready_node_.unlinked ())
+              {
+                // Idle reaper claimed it and will destroy it.
+                busy = true;
+              }
+
+            if (!busy)
+              {
+                break;
+              }
+
+            // Actively trigger reschedule IPI if running on another core
+            if (busy_cpu < OS_NCPU && busy_cpu != port_cpu_id ())
+              {
+                port_smp_ipi (busy_cpu);
+              }
+
+            {
+              // ----- Enter uncritical section -------------------------------
+              scheduler::uncritical_section sucs;
+
+              this_thread::yield ();
+              // ----- Exit uncritical section --------------------------------
+            }
+          }
+#endif /* defined(OS_USE_SMP_SCHEDULER) */
+
+        if (state_ == state::destroyed)
+          {
+#if defined(OS_TRACE_RTOS_THREAD)
+            trace::printf ("%s() @%p %s already gone\n", __func__, this,
+                           name ());
+#endif
+            instrumentation::thread::kill_retval (this, result::ok);
+            return result::ok; // Already exited itself
+          }
+
+        bool we_claimed = false;
+        {
+          // ----- Enter critical section -------------------------------------
+          interrupts::critical_section ics;
+
+          if (state_ != state::destroying && state_ != state::destroyed)
+            {
+              we_claimed = true;
+              state_ = state::destroying;
+
+              // Remove thread from the funeral list and kill it here.
+              ready_node_.unlink ();
+
+              // If the thread is waiting on an event, remove it from the list.
+              if (waiting_node_ != nullptr)
+                {
+                  waiting_node_->unlink ();
+                }
+
+              // If the thread is waiting on a timeout, remove it from the list.
+              if (clock_node_ != nullptr)
+                {
+                  clock_node_->unlink ();
+                }
+
+              child_links_.unlink ();
+            }
+          // ----- Exit critical section --------------------------------------
+        }
+
+        if (!we_claimed)
+          {
+            // The idle reaper already claimed this thread for destruction.
+            // Wait with lock released until it is completely destroyed.
+            while (state_ != state::destroyed)
+              {
+                scheduler::uncritical_section sucs;
+                this_thread::yield ();
+              }
+            instrumentation::thread::kill_retval (this, result::ok);
+            return result::ok;
+          }
+
+        // The must be no more children threads alive.
+        assert (children_.empty ());
+        parent_ = nullptr;
+
+#if defined(OS_USE_RTOS_PORT_SCHEDULER)
+
+        port::thread::destroy_other (this);
+
+#endif
+
+        func_result_ = nullptr;
+
+        func_ = nullptr;
+        func_args_ = nullptr;
+
+        internal_destroy_ ();
+
+        // There must be no mutexes locked by this thread.
+        // Must have been cleaned before.
+        assert (mutexes_.empty ());
+        assert (acquired_mutexes_ == 0);
+
+        // ----- Exit critical section ----------------------------------------
+      }
+
+      instrumentation::thread::kill_retval (this, result::ok);
+      return result::ok;
+    }
+
+    /**
+     * @details
+     * Set more bits in the thread current event flags mask.
+     * Use OR at bit-mask level.
+     * Wake-up the thread to evaluate the event flags.
+     *
+     * @note Can be invoked from Interrupt Service Routines.
+     */
+    result_t
+    thread::flags_raise (flags::mask_t mask, flags::mask_t* oflags)
+    {
+      instrumentation::thread::flags_raise (this, mask);
+
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+      trace::printf ("%s(0x%X) @%p %s <0x%X\n", __func__, mask, this, name (),
+                     event_flags_.mask ());
+#endif
+
+      result_t res = event_flags_.raise (mask, oflags);
+
+      this->resume ();
+
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+      trace::printf ("%s(0x%X) @%p %s >0x%X\n", __func__, mask, this, name (),
+                     event_flags_.mask ());
+#endif
+
+      instrumentation::thread::flags_raise_retval (this, res);
+
+      return res;
+    }
+
+#if defined(OS_INCLUDE_RTOS_THREAD_PUBLIC_FLAGS_CLEAR)
+
+    result_t
+    thread::flags_clear (flags::mask_t mask, flags::mask_t* oflags)
+    {
+      instrumentation::thread::flags_clear (this, mask);
+
+      result_t res = internal_flags_clear_ (mask, oflags);
+
+      instrumentation::thread::flags_clear_retval (this, res);
+      return res;
+    }
+
+#endif
+
+    /**
+     * @cond ignore
+     */
+
+    result_t
+    thread::internal_flags_wait_ (flags::mask_t mask, flags::mask_t* oflags,
+                                  flags::mode_t mode)
+    {
+      instrumentation::thread::flags_wait (this, mask, mode);
+
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+      trace::printf ("%s(0x%X,%u) @%p %s <0x%X\n", __func__, mask, mode, this,
+                     name (), event_flags_.mask ());
+#endif
+
+      // Don't call this from interrupt handlers.
+      os_assert_err (!interrupts::in_handler_mode (), EPERM);
+      // Don't call this from critical regions.
+      os_assert_err (!scheduler::locked (), EPERM);
+
+      {
+        // ----- Enter critical section ---------------------------------------
+        interrupts::critical_section ics;
+
+        if (event_flags_.check_raised (mask, oflags, mode))
+          {
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+            trace::printf ("%s(0x%X,%u) @%p %s >0x%X\n", __func__, mask, mode,
+                           this, name (), event_flags_.mask ());
+#endif
+            instrumentation::thread::flags_wait_retval (this, result::ok);
+            return result::ok;
+          }
+        // ----- Exit critical section ----------------------------------------
+      }
+
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+      clock::timestamp_t begin_timestamp = clock_->now ();
+#endif
+      for (;;)
+        {
+          {
+            // ----- Enter critical section -----------------------------------
+            interrupts::critical_section ics;
+
+            if (event_flags_.check_raised (mask, oflags, mode))
+              {
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+                clock::duration_t slept_ticks
+                    = static_cast<clock::duration_t> (clock_->now ()
+                                                      - begin_timestamp);
+                trace::printf ("%s(0x%X,%u) in %d @%p %s >0x%X\n", __func__,
+                               mask, mode, slept_ticks, this, name (),
+                               event_flags_.mask ());
+#endif
+                instrumentation::thread::flags_wait_retval (this, result::ok);
+                return result::ok;
+              }
+            // ----- Exit critical section ------------------------------------
+          }
+
+          internal_suspend_ (
+              OS_INTEGER_INSTRUMENTATION_SUSPEND_CAUSE_THREAD_FLAGS);
+
+          if (interrupted ())
+            {
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+              trace::printf ("%s(0x%X,%u) EINTR @%p %s\n", __func__, mask,
+                             mode, this, name ());
+#endif
+              instrumentation::thread::flags_wait_retval (this, EINTR);
+              return EINTR;
+            }
+        }
+
+      /* NOTREACHED */
+      // instrumentation::thread::flags_wait_retval (this, ENOTRECOVERABLE);
+      return ENOTRECOVERABLE;
+    }
+
+    result_t
+    thread::internal_flags_try_wait_ (flags::mask_t mask,
+                                      flags::mask_t* oflags,
+                                      flags::mode_t mode)
+    {
+      instrumentation::thread::flags_try_wait (this, mask, mode);
+
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+      trace::printf ("%s(0x%X,%u) @%p %s <0x%X\n", __func__, mask, mode, this,
+                     name (), event_flags_.mask ());
+#endif
+
+      // Don't call this from interrupt handlers.
+      os_assert_err (!interrupts::in_handler_mode (), EPERM);
+
+      {
+        // ----- Enter critical section ---------------------------------------
+        interrupts::critical_section ics;
+
+        if (event_flags_.check_raised (mask, oflags, mode))
+          {
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+            trace::printf ("%s(0x%X,%u) @%p %s >0x%X\n", __func__, mask, mode,
+                           this, name (), event_flags_.mask ());
+#endif
+            instrumentation::thread::flags_try_wait_retval (this, result::ok);
+            return result::ok;
+          }
+        else
+          {
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+            trace::printf ("%s(0x%X,%u) EWOULDBLOCK @%p %s \n", __func__, mask,
+                           mode, this, name ());
+#endif
+            instrumentation::thread::flags_try_wait_retval (this, EWOULDBLOCK);
+            return EWOULDBLOCK;
+          }
+        // ----- Exit critical section ----------------------------------------
+      }
+    }
+
+    result_t
+    thread::internal_flags_timed_wait_ (flags::mask_t mask,
+                                        clock::duration_t timeout,
+                                        flags::mask_t* oflags,
+                                        flags::mode_t mode)
+    {
+      instrumentation::thread::flags_timed_wait (this, mask, timeout, mode);
+
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+      trace::printf ("%s(0x%X,%u,%u) @%p %s <0x%X\n", __func__, mask, timeout,
+                     mode, this, name (), event_flags_.mask ());
+#endif
+
+      // Don't call this from interrupt handlers.
+      os_assert_err (!interrupts::in_handler_mode (), EPERM);
+      // Don't call this from critical regions.
+      os_assert_err (!scheduler::locked (), EPERM);
+
+      {
+        // ----- Enter critical section ---------------------------------------
+        interrupts::critical_section ics;
+
+        if (event_flags_.check_raised (mask, oflags, mode))
+          {
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+            trace::printf ("%s(0x%X,%u,%u) @%p %s >0x%X\n", __func__, mask,
+                           timeout, mode, this, name (), event_flags_.mask ());
+#endif
+            instrumentation::thread::flags_timed_wait_retval (this,
+                                                              result::ok);
+            return result::ok;
+          }
+        // ----- Exit critical section ----------------------------------------
+      }
+
+      internal::clock_timestamps_list& clock_list = clock_->steady_list ();
+      clock::timestamp_t timeout_timestamp = clock_->steady_now () + timeout;
+
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+      clock::timestamp_t begin_timestamp = clock_->steady_now ();
+#endif
+
+      // Prepare a timeout node pointing to the current thread.
+      internal::timeout_thread_node timeout_node{ timeout_timestamp, *this };
+
+      for (;;)
+        {
+          {
+            // ----- Enter critical section -----------------------------------
+            interrupts::critical_section ics;
+
+            if (event_flags_.check_raised (mask, oflags, mode))
+              {
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+                clock::duration_t slept_ticks
+                    = static_cast<clock::duration_t> (clock_->steady_now ()
+                                                      - begin_timestamp);
+#pragma GCC diagnostic push
+#if defined(__clang__)
+#elif defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Wuseless-cast"
+#endif
+                trace::printf ("%s(0x%X,%u,%u) in %u @%p %s >0x%X\n", __func__,
+                               mask, timeout, mode,
+                               static_cast<unsigned int> (slept_ticks), this,
+                               name (), event_flags_.mask ());
+#pragma GCC diagnostic pop
+#endif
+                instrumentation::thread::flags_timed_wait_retval (this,
+                                                                  result::ok);
+                return result::ok;
+              }
+
+            // Remove this thread from the ready list, if there.
+            port::this_thread::prepare_suspend ();
+
+            // Add this thread to the clock timeout list.
+            clock_list.link (timeout_node);
+            timeout_node.thread.clock_node_ = &timeout_node;
+
+            state_ = state::suspended;
+            // ----- Exit critical section ------------------------------------
+          }
+
+          instrumentation::thread::suspended (
+              this, OS_INTEGER_INSTRUMENTATION_SUSPEND_CAUSE_THREAD_FLAGS);
+
+          port::scheduler::reschedule ();
+
+          {
+            // ----- Enter critical section -----------------------------------
+            interrupts::critical_section ics;
+
+            // Remove the thread from the clock timeout list,
+            // if not already removed by the timer.
+            timeout_node.thread.clock_node_ = nullptr;
+            timeout_node.unlink ();
+            // ----- Exit critical section ------------------------------------
+          }
+
+          if (interrupted ())
+            {
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+              trace::printf ("%s(0x%X,%u,%u) EINTR @%p %s\n", __func__, mask,
+                             timeout, mode, this, name ());
+#endif
+              instrumentation::thread::flags_timed_wait_retval (this, EINTR);
+              return EINTR;
+            }
+
+          if (clock_->steady_now () >= timeout_timestamp)
+            {
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+              trace::printf ("%s(0x%X,%u,%u) ETIMEDOUT @%p %s\n", __func__,
+                             mask, timeout, mode, this, name ());
+#endif
+              instrumentation::thread::flags_timed_wait_retval (this,
+                                                                ETIMEDOUT);
+              return ETIMEDOUT;
+            }
+        }
+
+      /* NOTREACHED */
+      // instrumentation::thread::flags_timed_wait_retval (this,
+      // ENOTRECOVERABLE);
+      return ENOTRECOVERABLE;
+    }
+
+    /**
+     * @details
+     * Select the requested bits from the thread current flags mask
+     * and return them. If requested, clear the selected bits in the
+     * thread flags mask.
+     *
+     * If the mask is zero, return the full thread flags mask,
+     * without any masking or subsequent clearing.
+     *
+     * @warning Cannot be invoked from Interrupt Service Routines.
+     */
+    flags::mask_t
+    thread::internal_flags_get_ (flags::mask_t mask, flags::mode_t mode)
+    {
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+      trace::printf ("%s(0x%X) @%p %s\n", __func__, mask, this, name ());
+#endif
+
+      // Don't call this from interrupt handlers.
+      os_assert_err (!interrupts::in_handler_mode (), flags::all);
+
+      flags::mask_t ret = event_flags_.get (mask, mode);
+
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+      trace::printf ("%s(0x%X)=0x%X @%p %s\n", __func__, mask,
+                     event_flags_.mask (), this, name ());
+#endif
+      // Return the selected bits.
+      return ret;
+    }
+
+    /**
+     * @warning Cannot be invoked from Interrupt Service Routines.
+     */
+    result_t
+    thread::internal_flags_clear_ (flags::mask_t mask, flags::mask_t* oflags)
+    {
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+      trace::printf ("%s(0x%X) @%p %s <0x%X\n", __func__, mask, this, name (),
+                     event_flags_.mask ());
+#endif
+
+      // Don't call this from interrupt handlers.
+      os_assert_err (!interrupts::in_handler_mode (), EPERM);
+
+      result_t res = event_flags_.clear (mask, oflags);
+
+#if defined(OS_TRACE_RTOS_THREAD_FLAGS)
+      trace::printf ("%s(0x%X) @%p %s >0x%X\n", __func__, mask, this, name (),
+                     event_flags_.mask ());
+#endif
+      return res;
+    }
+
+    /**
+     * @endcond
+     */
+
+    // ------------------------------------------------------------------------
+    /**
+     * @details
+     * The os::rtos::this_thread namespace groups functions related to
+     * the current thread.
+     */
+    namespace this_thread
+    {
+
+      /**
+       * @cond ignore
+       */
+
+      rtos::thread*
+      _thread (void)
+      {
+        rtos::thread* th;
+
+#if defined(OS_USE_RTOS_PORT_SCHEDULER)
+
+        th = port::this_thread::thread ();
+
+#else
+
+#if defined(OS_USE_SMP_SCHEDULER)
+        {
+          // Read the core id and that core's current thread with this core's
+          // interrupts masked. With them enabled, a preemption between the
+          // two reads can move the caller to another core, and it would get
+          // back the thread now running on the core it left -- as a mutex
+          // owner, a waiter, or the errno it writes. The IRQ critical section
+          // is the per-core mask every port provides; it also takes the
+          // kernel lock, recursively, so a caller already inside one pays
+          // nothing more.
+          interrupts::critical_section ics;
+          th = scheduler::current_thread_[port_cpu_id ()];
+        }
+#else
+        th = scheduler::current_thread_;
+#endif /* defined(OS_USE_SMP_SCHEDULER) */
+
+#endif
+        return th;
+      }
+
+      /**
+       * @endcond
+       */
+
+      /**
+       * @warning Cannot be invoked from Interrupt Service Routines.
+       */
+      rtos::thread&
+      thread (void)
+      {
+        // Don't call this from interrupt handlers.
+        os_assert_throw (!interrupts::in_handler_mode (), EPERM);
+
+        rtos::thread* th;
+
+        th = _thread ();
+
+        // Could not get the current thread.
+        assert (th != nullptr);
+        return (*th);
+      }
+
+      /**
+       * @details
+       * Pass control to next thread that is in \b READY state.
+       *
+       * @warning Cannot be invoked from Interrupt Service Routines.
+       */
+      void
+      yield (void)
+      {
+        instrumentation::thread::yield (_thread ());
+
+        // Don't call this from interrupt handlers.
+        os_assert_throw (!interrupts::in_handler_mode (), EPERM);
+
+        if (!scheduler::started ())
+          {
+#if defined(OS_TRACE_RTOS_THREAD_CONTEXT)
+            trace::printf ("%s() nop %s \n", __func__, _thread ()->name ());
+#endif
+            return;
+          }
+
+#if defined(OS_TRACE_RTOS_THREAD_CONTEXT)
+        trace::printf ("%s() from %s\n", __func__, _thread ()->name ());
+#endif
+
+#if defined(OS_USE_RTOS_PORT_SCHEDULER)
+
+        port::this_thread::yield ();
+
+#else
+
+        // TODO: further investigate why this fails on the native port.
+        // if (os::rtos::scheduler::ready_threads_list_.head ()
+        //     != os::rtos::scheduler::ready_threads_list_.tail ())
+        {
+          port::scheduler::reschedule ();
+        }
+
+#endif
+
+#if defined(OS_TRACE_RTOS_THREAD_CONTEXT)
+        trace::printf ("%s() to %s\n", __func__, _thread ()->name ());
+#endif
+      }
+
+      /**
+       * @details
+       * Remove the current running thread from the ready list and pass
+       * control to the next ready thread. The
+       * thread will not be automatically rescheduled, it requires
+       * some other tread or interrupt service routine to add it
+       * back to the READY state (via `thread::resume()`).
+       *
+       * This is different from `yield()` which automatically
+       * reschedules the current thread before passing control to
+       * the next thread (which might be the same if no other
+       * threads with at least the same priority are ready).
+       *
+       * @warning Cannot be invoked from Interrupt Service Routines.
+       */
+      // NOTE: NOT 'inline'. It is declared non-inline in os-thread.h, and its
+      // body lives only here (not in a header), so other TUs (e.g. the C API
+      // wrapper os_this_thread_suspend) that odr-use it need an out-of-line
+      // definition. Marking it 'inline' meant no TU emitted one -> undefined
+      // reference unless the caller happened to be pruned by --gc-sections.
+      void
+      suspend (void)
+      {
+        os::instrumentation::thread::suspend (_thread ());
+
+        this_thread::thread ().internal_suspend_ (
+            OS_INTEGER_INSTRUMENTATION_SUSPEND_CAUSE_USER);
+      }
+
+      /**
+       * @warning Cannot be invoked from Interrupt Service Routines.
+       */
+      result_t
+      flags_clear (flags::mask_t mask, flags::mask_t* oflags)
+      {
+        instrumentation::thread::flags_clear (_thread (), mask);
+
+        result_t res
+            = this_thread::thread ().internal_flags_clear_ (mask, oflags);
+
+        instrumentation::thread::flags_clear_retval (_thread (), res);
+        return res;
+      }
+
+    } /* namespace this_thread */
+
+    // ------------------------------------------------------------------------
+  } /* namespace rtos */
+} /* namespace os */
+
+// ----------------------------------------------------------------------------

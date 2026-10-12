@@ -1,0 +1,156 @@
+/*
+ * This file is part of the µOS++ project (https://micro-os-plus.github.io/).
+ * Copyright (c) 2016-2025 Liviu Ionescu. All rights reserved.
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
+ * purpose is hereby granted, under the terms of the MIT license.
+ *
+ * If a copy of the license was not distributed with this file, it can be
+ * obtained from https://opensource.org/licenses/mit.
+ */
+
+#include <cmsis-plus/rtos/os.h>
+
+#if defined(__EXCEPTIONS)
+#include <string>
+#include <system_error>
+#endif
+
+// ----------------------------------------------------------------------------
+
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wc++98-compat"
+#pragma clang diagnostic ignored "-Wc++98-compat-bind-to-temporary-copy"
+#endif
+
+// ----------------------------------------------------------------------------
+
+using namespace os;
+
+// ----------------------------------------------------------------------------
+
+namespace os
+{
+  namespace estd
+  {
+    // ========================================================================
+
+#if defined(__EXCEPTIONS)
+
+    struct system_error_category : public std::error_category
+    {
+      virtual const char*
+      name () const noexcept override;
+
+      virtual std::string
+      message (int i) const override;
+    };
+
+    const char*
+    system_error_category::name () const noexcept
+    {
+      return "system";
+    }
+
+#pragma GCC diagnostic push
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wunused-parameter"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#endif
+
+    std::string
+    system_error_category::message (int i) const
+    {
+#if defined(DEBUG)
+      return std::string (strerror (i));
+#else
+      return std::string ("");
+#endif
+    }
+
+    struct cmsis_error_category : public std::error_category
+    {
+      virtual const char*
+      name () const noexcept override;
+
+      virtual std::string
+      message (int i) const override;
+    };
+
+    const char*
+    cmsis_error_category::name () const noexcept
+    {
+      return "cmsis";
+    }
+
+#pragma GCC diagnostic push
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wunused-parameter"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#endif
+
+    std::string
+    cmsis_error_category::message (int i) const
+    {
+#if defined(DEBUG)
+      return std::string (strerror (i));
+#else
+      return std::string ("");
+#endif
+    }
+
+#pragma GCC diagnostic pop
+
+    // `std::error_code` stores a pointer to its `error_category`, and the
+    // `error_code` (via the thrown `std::system_error`) outlives the throw
+    // expression. The category must therefore have static storage duration;
+    // a temporary would dangle. Function-local statics are constructed on
+    // first use and live until exit.
+    static const std::error_category&
+    get_system_error_category (void) noexcept
+    {
+      static const system_error_category category;
+      return category;
+    }
+
+    static const std::error_category&
+    get_cmsis_error_category (void) noexcept
+    {
+      static const cmsis_error_category category;
+      return category;
+    }
+
+#endif
+
+    void
+    __throw_system_error (int ev, const char* what_arg)
+    {
+#if defined(__EXCEPTIONS)
+      throw std::system_error (
+          std::error_code (ev, get_system_error_category ()), what_arg);
+#else
+      trace_printf ("system_error(%d, %s)\n", ev, what_arg);
+      std::abort ();
+#endif
+    }
+
+    void
+    __throw_cmsis_error (int ev, const char* what_arg)
+    {
+#if defined(__EXCEPTIONS)
+      throw std::system_error (std::error_code (ev, get_cmsis_error_category ()),
+                               what_arg);
+#else
+      trace_printf ("system_error(%d, %s)\n", ev, what_arg);
+      std::abort ();
+#endif
+    }
+
+    // ------------------------------------------------------------------------
+
+  } /* namespace estd */
+} /* namespace os */
+
+// ----------------------------------------------------------------------------

@@ -1,0 +1,119 @@
+/*
+ * This file is part of the µOS++ project (https://micro-os-plus.github.io/).
+ * Copyright (c) 2016-2025 Liviu Ionescu. All rights reserved.
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
+ * purpose is hereby granted, under the terms of the MIT license.
+ *
+ * If a copy of the license was not distributed with this file, it can be
+ * obtained from https://opensource.org/licenses/mit.
+ */
+
+/*
+ * The code is inspired by LLVM libcxx and GNU libstdc++-v3.
+ */
+
+#ifndef CMSIS_PLUS_ESTD_THREAD_
+#define CMSIS_PLUS_ESTD_THREAD_
+
+// ----------------------------------------------------------------------------
+
+// Include the next <thread> file found in the search path.
+#pragma GCC diagnostic push
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wgnu-include-next"
+#endif
+#include_next <thread>
+#pragma GCC diagnostic pop
+
+#include <type_traits>
+#include <functional>
+
+#include <cmsis-plus/rtos/os.h>
+
+#include <cmsis-plus/estd/chrono>
+
+// ----------------------------------------------------------------------------
+
+namespace os
+{
+  namespace estd
+  {
+    // ------------------------------------------------------------------------
+
+    /**
+     * @ingroup cmsis-plus-iso
+     * @{
+     */
+
+#include "thread_internal.h"
+
+    /**
+     * @}
+     */
+
+    // ========================================================================
+  } /* namespace estd */
+} /* namespace os */
+
+namespace std
+{
+#if 0
+// std::unary_function is deprecated in C++11.
+#pragma GCC diagnostic push
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+
+  // Define a std::hash specialisation.
+  template<>
+    struct hash<os::estd::thread::id> : public std::unary_function<
+        os::estd::thread::id, size_t>
+    {
+      inline size_t
+      operator() (os::estd::thread::id v) const
+      {
+        return std::hash<os::estd::thread::native_handle_type> () (
+            v.native_thread_);
+      }
+    };
+
+#pragma GCC diagnostic pop
+#endif
+} // namespace std
+
+#if defined(OS_HAS_STD_THREADS) && defined(OS_INCLUDE_STD_THREADS)
+
+namespace std
+{
+  /**
+   * @ingroup cmsis-plus-iso
+   * @{
+   */
+
+#include "thread_internal.h"
+
+  // Define a std::hash specialisation.
+  template <>
+  struct hash<std::thread::id>
+      : public std::unary_function<std::thread::id, size_t>
+  {
+    inline size_t
+    operator() (std::thread::id v) const
+    {
+      return std::hash<std::thread::native_handle_type> () (v.native_thread_);
+    }
+  };
+
+  /**
+   * @}
+   */
+} // namespace std
+
+#endif
+
+// ----------------------------------------------------------------------------
+
+#endif /* CMSIS_PLUS_ESTD_THREAD_ */

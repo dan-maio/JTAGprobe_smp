@@ -1,0 +1,642 @@
+/*
+ * This file is part of the µOS++ project (https://micro-os-plus.github.io/).
+ * Copyright (c) 2015-2025 Liviu Ionescu. All rights reserved.
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
+ * purpose is hereby granted, under the terms of the MIT license.
+ *
+ * If a copy of the license was not distributed with this file, it can be
+ * obtained from https://opensource.org/licenses/mit.
+ */
+
+#if defined(OS_USE_OS_APP_CONFIG_H)
+#include <cmsis-plus/os-app-config.h>
+#endif
+
+#include <cmsis-plus/posix-io/device.h>
+#include <cmsis-plus/posix/sys/uio.h>
+#include <cmsis-plus/posix-io/device-registry.h>
+#include <cmsis-plus/posix-io/file.h>
+#include <cmsis-plus/posix-io/file-descriptors-manager.h>
+#include <cmsis-plus/posix-io/file-system.h>
+#include <cmsis-plus/posix-io/io.h>
+
+#include <cmsis-plus/diag/trace.h>
+
+#include <cmsis-plus/rtos/os.h>
+#include <cmsis-plus/diag/instrumentation.h>
+
+#include <cassert>
+#include <cerrno>
+#include <cstdarg>
+
+// ----------------------------------------------------------------------------
+
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wc++98-compat"
+#endif
+
+// ----------------------------------------------------------------------------
+
+// Variadic calls are processed in two steps, first prepare a
+// va_list structure, then call implementation functions like doOpen()
+// doIoctl(), that use 'va_list args'.
+
+namespace os
+{
+  namespace posix
+  {
+    // ------------------------------------------------------------------------
+
+    io*
+    open (const char* path, int oflag, ...)
+    {
+      // Forward to the variadic version of the function.
+      std::va_list args;
+      va_start (args, oflag);
+      io* const ret = vopen (path, oflag, args);
+      va_end (args);
+
+      return ret;
+    }
+
+    /**
+     * The actual open workhorse. Using the _path_, try to identify the
+     * `io` object, then call the implementation. If successful, allocate a
+     * new POSIX file descriptor, to be used by C functions.
+     */
+    io*
+    vopen (const char* path, int oflag, std::va_list args)
+    {
+      instrumentation::posix::vopen (path, oflag);
+
+#if defined(OS_TRACE_POSIX_IO_IO)
+      trace::printf ("io::%s(\"%s\")\n", __func__, path ? path : "");
+#endif
+
+      if (path == nullptr)
+        {
+          errno = EFAULT;
+
+          instrumentation::posix::vopen_retval (nullptr);
+          return nullptr;
+        }
+
+      if (*path == '\0')
+        {
+          errno = ENOENT;
+
+          instrumentation::posix::vopen_retval (nullptr);
+          return nullptr;
+        }
+
+      errno = 0;
+
+      os::posix::io* io;
+      const char* adjusted_path = path;
+
+      while (true)
+        {
+          // Check if path is a device.
+          io = os::posix::device_registry<device>::identify_device (path);
+          if (io != nullptr)
+            {
+              // If so, use the implementation to open the device.
+              int oret = static_cast<device*> (io)->vopen (path, oflag, args);
+              if (oret < 0)
+                {
+                  // Open failed.
+
+                  instrumentation::posix::vopen_retval (nullptr);
+                  return nullptr;
+                }
+
+              // File descriptor already allocated by device.
+              break;
+            }
+
+          // Check if a regular file.
+          adjusted_path = path;
+          auto* const fs
+              = os::posix::file_system::identify_mounted (&adjusted_path);
+
+          // The manager will return null if there are no file systems
+          // registered, no need to check this condition separately.
+          if (fs == nullptr)
+            {
+              errno = EBADF;
+              instrumentation::posix::vopen_retval (nullptr);
+              return nullptr;
+            }
+
+          // Use the file system implementation to open the file, using
+          // the adjusted path (mount point prefix removed).
+          io = fs->vopen (adjusted_path, oflag, args);
+          if (io == nullptr)
+            {
+              // Open failed.
+              instrumentation::posix::vopen_retval (nullptr);
+              return nullptr;
+            }
+
+          break;
+        }
+
+        // Return a valid pointer to an object derived from io, or nullptr.
+
+#if defined(OS_TRACE_POSIX_IO_IO)
+      trace::printf ("io::%s(\"%s\")=%p fd=%d\n", __func__, path, io,
+                     io->file_descriptor ());
+#endif
+
+      instrumentation::posix::vopen_retval (io, adjusted_path);
+      return io;
+    }
+
+    // ========================================================================
+
+    io::io (io_impl& impl, type t)
+        : impl_ (impl), //
+          type_ (static_cast<type_t> (t))
+    {
+      instrumentation::posix::io::create (this, static_cast<unsigned int> (t));
+
+#if defined(OS_TRACE_POSIX_IO_IO)
+      trace::printf ("io::%s()=%p\n", __func__, this);
+#endif
+
+      file_descriptor_ = no_file_descriptor;
+    }
+
+    io::~io ()
+    {
+      instrumentation::posix::io::destroy (this);
+
+#if defined(OS_TRACE_POSIX_IO_IO)
+      trace::printf ("io::%s() @%p\n", __func__, this);
+#endif
+
+      file_descriptor_ = no_file_descriptor;
+    }
+
+    // ------------------------------------------------------------------------
+
+    int
+    io::close (void)
+    {
+      instrumentation::posix::io::close (this);
+
+#if defined(OS_TRACE_POSIX_IO_IO)
+      trace::printf ("io::%s() @%p\n", __func__, this);
+#endif
+
+      if (!impl ().do_is_opened ())
+        {
+          errno = EBADF; // Not opened.
+
+          instrumentation::posix::io::close_retval (this, -1);
+          return -1;
+        }
+
+      errno = 0;
+
+      // Execute the implementation specific code.
+      int ret = impl ().do_close ();
+
+      // Remove this IO from the file descriptors registry.
+      file_descriptors_manager::deallocate (file_descriptor_);
+      file_descriptor_ = no_file_descriptor;
+
+      instrumentation::posix::io::close_retval (this, ret);
+      return ret;
+    }
+
+    io*
+    io::alloc_file_descriptor (void)
+    {
+#if defined(OS_TRACE_POSIX_IO_IO)
+      trace::printf ("io::%s() @%p\n", __func__, this);
+#endif
+
+      int fd = file_descriptors_manager::allocate (this);
+      if (fd < 0)
+        {
+          // If allocation failed, close this object.
+          impl ().do_close ();
+          clear_file_descriptor ();
+          return nullptr;
+        }
+
+#if defined(OS_TRACE_POSIX_IO_IO)
+      trace::printf ("io::%s() @%p fd=%d\n", __func__, this, fd);
+#endif
+
+      // Return a valid pointer to an object derived from `io`.
+      return this;
+    }
+
+    // ------------------------------------------------------------------------
+
+    // All these wrappers are required to clear 'errno'.
+
+    ssize_t
+    io::read (void* buf, std::size_t nbyte)
+    {
+      instrumentation::posix::io::read (this, buf, nbyte);
+
+#if defined(OS_TRACE_POSIX_IO_IO)
+      trace::printf ("io::%s(0x0%X, %u) @%p\n", __func__, buf, nbyte, this);
+#endif
+
+      if (buf == nullptr)
+        {
+          errno = EFAULT;
+
+          instrumentation::posix::io::read_retval (this, -1);
+          return -1;
+        }
+
+      if (!impl ().do_is_opened ())
+        {
+          errno = EBADF; // Not opened.
+
+          instrumentation::posix::io::read_retval (this, -1);
+          return -1;
+        }
+
+      if (!impl ().do_is_connected ())
+        {
+          errno = EIO; // Not opened.
+
+          instrumentation::posix::io::read_retval (this, -1);
+          return -1;
+        }
+
+      errno = 0;
+
+      // http://pubs.opengroup.org/onlinepubs/9699919799/functions/read.html
+      // Before any action described below is taken, and if nbyte is zero,
+      // the read() function may detect and return errors as described below.
+      // In the absence of errors, or if error detection is not performed,
+      // the read() function shall return zero and have no other results.
+      if (nbyte == 0)
+        {
+          instrumentation::posix::io::read_retval (this, 0);
+          return 0; // Nothing to do.
+        }
+
+      // Execute the implementation specific code.
+      ssize_t ret = impl ().do_read (buf, nbyte);
+      if (ret >= 0)
+        {
+          impl ().offset_ += ret;
+        }
+
+#if defined(OS_TRACE_POSIX_IO_IO)
+      trace::printf ("io::%s(0x0%X, %u) @%p n=%d\n", __func__, buf, nbyte,
+                     this, ret);
+#endif
+
+      instrumentation::posix::io::read_retval (this, ret);
+      return ret;
+    }
+
+    ssize_t
+    io::write (const void* buf, std::size_t nbyte)
+    {
+      instrumentation::posix::io::write (this, buf, nbyte);
+
+#if defined(OS_TRACE_POSIX_IO_IO)
+      trace::printf ("io::%s(0x0%X, %u) @%p\n", __func__, buf, nbyte, this);
+#endif
+
+      if (buf == nullptr)
+        {
+          errno = EFAULT;
+
+          instrumentation::posix::io::write_retval (this, -1);
+          return -1;
+        }
+
+      if (!impl ().do_is_opened ())
+        {
+          errno = EBADF; // Not opened.
+
+          instrumentation::posix::io::write_retval (this, -1);
+          return -1;
+        }
+
+      if (!impl ().do_is_connected ())
+        {
+          errno = EIO; // Not opened.
+
+          instrumentation::posix::io::write_retval (this, -1);
+          return -1;
+        }
+
+      errno = 0;
+
+      // http://pubs.opengroup.org/onlinepubs/9699919799/functions/pwrite.html
+      // Before any action described below is taken, and if nbyte is zero
+      // and the file is a regular file, the write() function may detect and
+      // return errors as described below. In the absence of errors, or if
+      // error detection is not performed, the write() function shall return
+      // zero and have no other results. If nbyte is zero and the file is
+      // not a regular file, the results are unspecified.
+      if (nbyte == 0)
+        {
+          instrumentation::posix::io::write_retval (this, 0);
+          return 0; // Nothing to do.
+        }
+
+      // Execute the implementation specific code.
+      ssize_t ret = impl ().do_write (buf, nbyte);
+      if (ret >= 0)
+        {
+          impl ().offset_ += ret;
+        }
+
+#if defined(OS_TRACE_POSIX_IO_IO)
+      trace::printf ("io::%s(0x0%X, %u) @%p n=%d\n", __func__, buf, nbyte,
+                     this, ret);
+#endif
+
+      instrumentation::posix::io::write_retval (this, 0);
+      return ret;
+    }
+
+    ssize_t
+    io::writev (const /* struct */ iovec* iov, int iovcnt)
+    {
+      instrumentation::posix::io::writev (this, iov, iovcnt);
+
+#if defined(OS_TRACE_POSIX_IO_IO)
+      trace::printf ("io::%s(0x0%X, %d) @%p\n", __func__, iov, iovcnt, this);
+#endif
+
+      if (iov == nullptr)
+        {
+          errno = EFAULT;
+
+          instrumentation::posix::io::writev_retval (this, -1);
+          return -1;
+        }
+
+      if (iovcnt <= 0)
+        {
+          errno = EINVAL;
+
+          instrumentation::posix::io::writev_retval (this, -1);
+          return -1;
+        }
+
+      if (!impl ().do_is_opened ())
+        {
+          errno = EBADF; // Not opened.
+
+          instrumentation::posix::io::writev_retval (this, -1);
+          return -1;
+        }
+
+      if (!impl ().do_is_connected ())
+        {
+          errno = EIO; // Not opened.
+          instrumentation::posix::io::writev_retval (this, -1);
+          return -1;
+        }
+
+      errno = 0;
+
+      // Execute the implementation specific code.
+      ssize_t ret = impl ().do_writev (iov, iovcnt);
+      if (ret >= 0)
+        {
+          impl ().offset_ += ret;
+        }
+
+      instrumentation::posix::io::writev_retval (this, ret);
+      return ret;
+    }
+
+    int
+    io::fcntl (int cmd, ...)
+    {
+      // Forward to the variadic version of the function.
+      std::va_list args;
+      va_start (args, cmd);
+      int ret = vfcntl (cmd, args);
+      va_end (args);
+
+      return ret;
+    }
+
+#pragma GCC diagnostic push
+#if defined(__clang__)
+#elif defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Wsuggest-final-methods"
+#endif
+    int
+    io::vfcntl (int cmd, std::va_list args)
+    {
+      instrumentation::posix::io::vfcntl (this, cmd);
+
+#if defined(OS_TRACE_POSIX_IO_IO)
+      trace::printf ("io::%s(%d) @%p\n", __func__, cmd, this);
+#endif
+
+      if (!impl ().do_is_opened ())
+        {
+          errno = EBADF; // Not opened.
+
+          instrumentation::posix::io::vfcntl_retval (this, -1);
+          return -1;
+        }
+
+      if (!impl ().do_is_connected ())
+        {
+          errno = EIO; // Not opened.
+
+          instrumentation::posix::io::vfcntl_retval (this, -1);
+          return -1;
+        }
+
+      errno = 0;
+
+      // Execute the implementation specific code.
+      int ret = impl ().do_vfcntl (cmd, args);
+
+      instrumentation::posix::io::vfcntl_retval (this, ret);
+      return ret;
+    }
+#pragma GCC diagnostic pop
+
+    int
+    io::isatty (void)
+    {
+      instrumentation::posix::io::isatty (this);
+
+      errno = 0;
+
+      // Execute the implementation specific code.
+      int ret = impl ().do_isatty ();
+
+      instrumentation::posix::io::isatty_retval (this, ret);
+      return ret;
+    }
+
+    // fstat() on a socket returns a zero'd buffer.
+    int
+    io::fstat (struct stat* buf)
+    {
+      instrumentation::posix::io::fstat (this, buf);
+
+#if defined(OS_TRACE_POSIX_IO_IO)
+      trace::printf ("io::%s(%p) @%p\n", __func__, buf, this);
+#endif
+
+      if (buf == nullptr)
+        {
+          errno = EFAULT;
+
+          instrumentation::posix::io::fstat_retval (this, -1);
+          return -1;
+        }
+
+      if (!impl ().do_is_opened ())
+        {
+          errno = EBADF; // Not opened.
+
+          instrumentation::posix::io::fstat_retval (this, -1);
+          return -1;
+        }
+
+      if (!impl ().do_is_connected ())
+        {
+          errno = EIO; // Not opened.
+
+          instrumentation::posix::io::fstat_retval (this, -1);
+          return -1;
+        }
+
+      errno = 0;
+
+      // Execute the implementation specific code.
+      int ret = impl ().do_fstat (buf);
+
+      instrumentation::posix::io::fstat_retval (this, ret);
+      return ret;
+    }
+
+    off_t
+    io::lseek (off_t offset, int whence)
+    {
+      instrumentation::posix::io::lseek (this, offset, whence);
+
+#if defined(OS_TRACE_POSIX_IO_IO)
+      trace::printf ("io::%s(%d, %d) @%p\n", __func__, offset, whence, this);
+#endif
+
+      if (!impl ().do_is_opened ())
+        {
+          errno = EBADF; // Not opened.
+
+          instrumentation::posix::io::lseek_retval (this, -1);
+          return -1;
+        }
+
+      errno = 0;
+
+      // Execute the implementation specific code.
+      off_t ret = impl ().do_lseek (offset, whence);
+
+      instrumentation::posix::io::lseek_retval (this, ret);
+      return ret;
+    }
+
+    // ========================================================================
+
+    io_impl::io_impl (void)
+    {
+#if defined(OS_TRACE_POSIX_IO_IO)
+      trace::printf ("io_impl::%s()=%p\n", __func__, this);
+#endif
+    }
+
+    io_impl::~io_impl ()
+    {
+#if defined(OS_TRACE_POSIX_IO_IO)
+      trace::printf ("io_impl::%s() @%p\n", __func__, this);
+#endif
+    }
+
+    void
+    io_impl::do_deallocate (void)
+    {
+      return;
+    }
+
+#pragma GCC diagnostic push
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wunused-parameter"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wsuggest-final-methods"
+#endif
+
+    bool
+    io_impl::do_is_connected (void)
+    {
+      return true;
+    }
+
+    ssize_t
+    io_impl::do_writev (const /* struct */ iovec* iov, int iovcnt)
+    {
+      ssize_t total = 0;
+
+#pragma GCC diagnostic push
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
+#endif
+      const /* struct */ iovec* p = iov;
+      for (int i = 0; i < iovcnt; ++i, ++p)
+        {
+          ssize_t ret = do_write (p->iov_base, p->iov_len);
+          if (ret < 0)
+            {
+              return ret;
+            }
+          total += ret;
+        }
+#pragma GCC diagnostic pop
+      return total;
+    }
+
+    int
+    io_impl::do_vfcntl (int cmd, std::va_list args)
+    {
+      errno = ENOSYS; // Not implemented
+      return -1;
+    }
+
+    int
+    io_impl::do_isatty (void)
+    {
+      errno = ENOTTY; // By default, it is not a TTY.
+      return 0;
+    }
+
+    int
+    io_impl::do_fstat (struct stat* buf)
+    {
+      errno = ENOSYS; // Not implemented
+      return -1;
+    }
+
+#pragma GCC diagnostic pop
+
+    // ========================================================================
+  } /* namespace posix */
+} /* namespace os */
+
+// ----------------------------------------------------------------------------
