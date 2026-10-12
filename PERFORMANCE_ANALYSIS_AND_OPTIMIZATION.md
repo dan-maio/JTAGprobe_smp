@@ -459,12 +459,13 @@ The top `CMakeLists.txt` adds the port with `add_subdirectory`, links `micro-os-
 - Every tinyusb call is made with `usb_mutex` held. tinyusb's `tud_event_hook_cb` posts `usb_sem` to wake the `TUD` thread on each USB event.
 - DAP requests (OUT endpoint → `DAP`) and responses (`DAP` → IN endpoint) cross between the cores in two lock-free single-producer/single-consumer rings of `DAP_PACKET_COUNT` = 4 slots, with free-running indices and a `__dmb()` between a slot's data and the index that publishes it.
 
-### 8.4 Three versions of the DAP hand-off
-1. **First build (measured, § 9):** the `DAP` thread slept on `dap_sem` after every packet, and posted `usb_sem` so the `TUD` thread on core 0 started each IN transfer. Per packet that is two cross-core wake-ups (IPI + PendSV + context switch on each core) on the critical path.
+### 8.4 Four versions of the DAP hand-off
+1. **First build (measured, § 9; history, fixed in the second build):** the `DAP` thread slept on `dap_sem` after every packet, and posted `usb_sem` so the `TUD` thread on core 0 started each IN transfer. Per packet that was two cross-core wake-ups (IPI + PendSV + context switch on each core) on the critical path.
 2. **Second build (measured, § 9: ~38 KB/s):** the `DAP` thread busy-waits up to **2 ms** (`DAP_SPIN_US`) for the next packet or a free response slot before sleeping, and starts the IN transfer (and re-arms a stalled OUT endpoint) itself when `os_mutex_try_lock(&usb_mutex)` succeeds, as the single-core firmware does from its DAP task; otherwise it posts `usb_sem`. During a load no thread sleeps on the packet path.
-3. **Current build (measured, § 9.4):** as the second, plus:
+3. **Third build (measured, § 9.4):** as the second, plus:
    - the `TUD` thread on core 0 keeps polling `tud_task()` for **2 ms** (`USB_SPIN_US`) after the last DAP packet moved, instead of sleeping on `usb_sem` (`dap_edpt_active()`); `UART` still preempts it;
    - **per-stage packet timing**, kept by the firmware and read by the host with DAP vendor command `0x80` (§ 8.5).
+4. **Current build (measured, § 9.6):** as the third, with **512-byte DAP packets** (`DAP_PACKET_SIZE` 512) over the 64-byte full-speed bulk endpoint. A request arrives as up to eight USB packets; the OUT endpoint is armed one USB packet at a time, and `dap_req_len()` (a parser of the DAP command lengths) decides whether a request ends on a full 64-byte packet, since the host sends no ZLP. A response of a 64-byte multiple shorter than 512 bytes is followed by a ZLP.
 
 ### 8.5 Packet timing (DAP vendor command 0x80)
 The firmware time-stamps every DAP packet with the RP2040's 1 MHz timer (shared by both cores) and keeps twelve 32-bit counters. OpenOCD's `cmsis-dap cmd` prints only the first four bytes of a reply, so the host reads one counter per command:
@@ -494,7 +495,7 @@ cmsis-dap cmd 0x80 <i>      ;# read counter i (0..11): "Returned data b0 b1 b2 b
 - Rates are in KB/s with 1 KB = 1000 bytes.
 
 > [!NOTE]
-> In JTAG mode OpenOCD's CMSIS-DAP driver does not use `DAP_TransferBlock` (§ 2.2); it sends raw `DAP_JTAG_Sequence` commands, every TMS bit and idle clock its own entry. The probe's own counters (§ 8.5) show **~9.9 loaded bytes per packet** with `memaccess 0` (74,888 bytes in 7,541 packets; 80,984 in 8,122), and OpenOCD waits for each reply before sending the next request. A load is therefore limited by the per-packet round trip, not by the TCK frequency.
+> In JTAG mode OpenOCD's CMSIS-DAP driver does not use `DAP_TransferBlock` (§ 2.2); it sends raw `DAP_JTAG_Sequence` commands, every TMS bit and idle clock its own entry. The probe's own counters (§ 8.5) show **~9.9 loaded bytes per packet** with `memaccess 0` (74,888 bytes in 7,541 packets; 80,984 in 8,122), and OpenOCD waits for each reply before sending the next request. A load is therefore limited by the per-packet round trip, not by the TCK frequency. OpenOCD sizes its JTAG queue to the probe's packet size: with 512-byte packets (§ 9.6) a packet carries **~85.7 loaded bytes** (74,888 bytes in 874 packets; 80,984 in 940).
 
 ### 9.2 Measurements
 
@@ -507,12 +508,14 @@ cmsis-dap cmd 0x80 <i>      ;# read counter i (0..11): "Returned data b0 b1 b2 b
 | JTAGprobe_smp, first build | smp_mem_inter_test | 80,984 | **8,136 ms** | **9.95 KB/s** | 998 µs |
 | JTAGprobe_smp, second build | smp_mem_test | 74,888 | **1,983 ms** | **37.8 KB/s** | 263 µs |
 | JTAGprobe_smp, second build | smp_mem_inter_test | 80,984 | **2,125 ms** | **38.1 KB/s** | 261 µs |
-| JTAGprobe_smp, current build | smp_mem_test | 74,888 | **1,994 ms** | **37.6 KB/s** | 264 µs *counted* |
-| JTAGprobe_smp, current build | smp_mem_inter_test | 80,984 | **2,143 ms** | **37.8 KB/s** | 263 µs *counted* |
-| JTAGprobe_smp, current build, rerun | smp_mem_test | 74,888 | **1,954 ms** | **38.3 KB/s** | 259 µs |
-| JTAGprobe_smp, current build, rerun | smp_mem_inter_test | 80,984 | **2,106 ms** | **38.5 KB/s** | 259 µs |
+| JTAGprobe_smp, third build | smp_mem_test | 74,888 | **1,994 ms** | **37.6 KB/s** | 264 µs *counted* |
+| JTAGprobe_smp, third build | smp_mem_inter_test | 80,984 | **2,143 ms** | **37.8 KB/s** | 263 µs *counted* |
+| JTAGprobe_smp, third build, rerun | smp_mem_test | 74,888 | **1,954 ms** | **38.3 KB/s** | 259 µs |
+| JTAGprobe_smp, third build, rerun | smp_mem_inter_test | 80,984 | **2,106 ms** | **38.5 KB/s** | 259 µs |
+| JTAGprobe_smp, current build (512-byte packets) | smp_mem_test | 74,888 | **1,528–1,547 ms** | **48.4–49.0 KB/s** | 1,745 µs *counted* (85.7 B) |
+| JTAGprobe_smp, current build (512-byte packets) | smp_mem_inter_test | 80,984 | **1,644–1,649 ms** | **49.1–49.3 KB/s** | 1,733 µs *counted* (86.2 B) |
 
-Per packet: *counted* = `load_image` time divided by the probe's packet counter; the other rows use the same 9.9 bytes per packet, since OpenOCD and the images are the same.
+Per packet: *counted* = the probe's own OUT → OUT mean; the other rows divide by 9.9 bytes per packet, since OpenOCD and the images are the same.
 
 Same image, three firmwares (smp_mem_inter_test, 80,984 bytes):
 
@@ -522,19 +525,20 @@ Same image, three firmwares (smp_mem_inter_test, 80,984 bytes):
 | JTAGprobe `jtagprobe-new`, FreeRTOS, 1 core | 2,380 ms | 34.0 KB/s | 32× | 1× |
 | JTAGprobe_smp, first build | 8,136 ms | 9.95 KB/s | 9.5× | 0.29× |
 | **JTAGprobe_smp, second build** | **2,125 ms** | **38.1 KB/s** | **36×** | **1.12×** |
-| JTAGprobe_smp, current build | 2,143 ms | 37.8 KB/s | 36× | 1.11× |
+| JTAGprobe_smp, third build | 2,143 ms | 37.8 KB/s | 36× | 1.11× |
+| **JTAGprobe_smp, current build (512-byte packets)** | **1,644–1,649 ms** | **49.1–49.3 KB/s** | **47×** | **1.45×** |
 
 Every one of these tests also **passed** after its load. Whole-test CTest times (15 s reset wait included), without semihosting prints (§ 9.5 has them with):
 
-| Test | FreeRTOS JTAGprobe | JTAGprobe_smp (first build) | JTAGprobe_smp (second build) | JTAGprobe_smp (current, 10 s reset wait) |
-| :--- | ---: | ---: | ---: | ---: |
-| smp_test4 | 29.6 s | — | — | — |
-| smp_mem_test | 140–142 s | 61.0 s | **54.2 s** | **50.2 s** |
-| smp_mem_inter_test | 190.1 s | 193.1 s | **186.0 s** | **193.4 s** |
+| Test | FreeRTOS JTAGprobe | JTAGprobe_smp (first build) | JTAGprobe_smp (second build) | JTAGprobe_smp (third, 10 s reset wait) | JTAGprobe_smp (current, 512-byte packets, 10 s reset wait) |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| smp_test4 | 29.6 s | — | — | — | — |
+| smp_mem_test | 140–142 s | 61.0 s | **54.2 s** | **50.2 s** | **47.1 s** |
+| smp_mem_inter_test | 190.1 s | 193.1 s | **186.0 s** | **193.4 s** | **175.9 s** |
 
-The last column's runs wait 10 s after the board reset instead of 15 s. smp_mem_inter_test's time is set by its own computing on the Pi (~170 s) and varies by several seconds from run to run (186–193 s), so the probe firmware hardly shows there.
+The last two columns' runs wait 10 s after the board reset instead of 15 s. smp_mem_inter_test's time is set by its own computing on the Pi (~170 s) and varies by several seconds from run to run (186–193 s), so the probe firmware hardly shows there.
 
-**Reading the numbers:** the first SMP build spent about **700 µs more per packet** than the single-core firmware (≈ 1,000 µs against ≈ 251–292 µs): the two cross-core wake-ups per packet of § 8.4. That made the load about **4× slower** (9.95 KB/s against 34–39.5 KB/s). The second build takes those wake-ups off the packet path: ≈ 262 µs per packet, **3.8× faster** than the first SMP build and as fast as the single-core firmware (on the same image, smp_mem_inter_test, 2.13 s against 2.38 s). The `TUD` spin of the current build changed nothing measurable (2,143 ms against 2,125 ms): § 9.4 shows why. smp_mem_test as a whole finished in 54.2 s with the SMP probe, against 140 s with the single-core one, so the gain there comes from the run after the load (semihosting and memory polling traffic: isolated packets rather than a stream), with the DAP work on core 1 and the USB and UART work on core 0. That part was not profiled packet by packet.
+**Reading the numbers:** the first SMP build spent about **700 µs more per packet** than the single-core firmware (≈ 1,000 µs against ≈ 251–292 µs): the two cross-core wake-ups per packet of § 8.4. That made the load about **4× slower** (9.95 KB/s against 34–39.5 KB/s). The second build takes those wake-ups off the packet path: ≈ 262 µs per packet, **3.8× faster** than the first SMP build and as fast as the single-core firmware (on the same image, smp_mem_inter_test, 2.13 s against 2.38 s). The `TUD` spin of the third build changed nothing measurable (2,143 ms against 2,125 ms): § 9.4 shows why. The 512-byte packets of the current build load about **23 % faster** again (§ 9.6). smp_mem_test as a whole finished in 54.2 s with the SMP probe, against 140 s with the single-core one, so the gain there comes from the run after the load (semihosting and memory polling traffic: isolated packets rather than a stream), with the DAP work on core 1 and the USB and UART work on core 0. That part was not profiled packet by packet.
 
 ### 9.3 Computed load times per test image
 
@@ -557,7 +561,7 @@ Each test's loaded bytes divided by the measured rates: **39.5 KB/s** (FreeRTOS 
 
 **Formula:** $t_{load} \approx \dfrac{\text{loaded bytes}}{\text{rate}} \approx \dfrac{\text{loaded bytes}}{9.9} \times t_{packet}$, with $t_{packet}$ ≈ 251–292 µs (FreeRTOS JTAGprobe), ≈ 262 µs (JTAGprobe_smp second and current builds), ≈ 1,000 µs (JTAGprobe_smp first build).
 
-### 9.4 Where the time per packet goes (current build)
+### 9.4 Where the time per packet goes (third build, 64-byte packets)
 
 From the probe's counters (§ 8.5), reset just before `load_image` and read just after it:
 
@@ -574,7 +578,7 @@ From the probe's counters (§ 8.5), reset just before `load_image` and read just
 
 - The hand-off between the two cores now costs about **7 µs per packet** (0.9 + 0.4 + 6.1): the dual-core split is no longer on the critical path.
 - OpenOCD sends one request at a time and waits for its reply (no OUT stalls, a single packet in flight). About **70 %** of each cycle is the USB round trip and the PC's turnaround, which no split of work between the probe's cores can remove; the JTAG bit-banging is about **26 %**.
-- The remaining gains are therefore fewer round trips (larger `DAP_PACKET_SIZE`, so OpenOCD packs more into each command) and faster bit-banging (PIO).
+- The remaining gains are therefore fewer round trips (larger `DAP_PACKET_SIZE`, so OpenOCD packs more into each command: done in the current build, § 9.6) and faster bit-banging (PIO).
 
 ### 9.5 Semihosting load: `SEMI_PRINTS=1`
 
@@ -587,7 +591,40 @@ The µOS++ AArch64 port's rpi4b tests take a CMake option `SEMI_PRINTS` (0/1, hw
 | CTest total | 54.2 s | **337.4 s, PASS** | 186.0 s | **620.5 s, PASS** |
 | Lines through semihosting | 1 | ~300 | 1 | ~480 |
 
-A semihosting line costs about **0.9 s**: OpenOCD's `SYS_WRITE0` reads the string from the target **one byte per JTAG memory access** (≈ 7–10 ms each), then resumes the core. That cost is OpenOCD's method, not the probe's turnaround.
+A semihosting line costs about **0.9 s**: OpenOCD's `SYS_WRITE0` reads the string from the target **one byte per JTAG memory access** (≈ 7–10 ms each), then resumes the core. That cost is OpenOCD's method, not the probe's turnaround. The table is for the 64-byte third build; with 512-byte packets (§ 9.6) both tests also pass with `SEMI_PRINTS=1`, in **308.1 s** and **561.8 s**.
+
+### 9.6 512-byte DAP packets (current build)
+
+Same Pi 4 B, OpenOCD and images; only `DAP_PACKET_SIZE` changed from 64 to 512 (§ 8.4, item 4). Probe counters for the load, per packet, mean:
+
+| Per packet, mean | 64 bytes, smp_mem_test (7,541 packets) | 512 bytes, smp_mem_test (874 packets) | 512 bytes, smp_mem_inter_test (940 packets) |
+| :--- | ---: | ---: | ---: |
+| Loaded bytes per packet | 9.9 | **85.7** | **86.2** |
+| OUT → next OUT (one full cycle) | 263.5 µs | **1,745 µs** | **1,733 µs** |
+| OUT received → DAP thread starts it | 0.9 µs | 1.9 µs | 1.1 µs |
+| `DAP_ExecuteCommand()` | 68.2 µs | 581.4 µs (max 602) | 582.1 µs (max 601) |
+| response ready → IN started | 6.1 µs | 7.0 µs | 6.7 µs |
+| IN started → host collected it | 72.8 µs | 242.9 µs | 239.7 µs |
+| rest: receiving the request + PC turnaround | ≈ 115 µs | **≈ 912 µs** | ≈ 902 µs |
+| Cycle time per loaded byte | 26.6 µs | **20.4 µs** | 20.1 µs |
+
+Whole runs (CTest, 10 s reset wait), all **PASS**:
+
+| hwd test | 64-byte packets | 512-byte packets | Change |
+| :--- | ---: | ---: | ---: |
+| smp_mem_test, load | 1,954–1,994 ms | 1,528–1,547 ms | −23 % |
+| smp_mem_inter_test, load | 2,106–2,143 ms | 1,644–1,649 ms | −23 % |
+| smp_mem_test, `SEMI_PRINTS=0` | 50.2 s | **47.1 s** | −3.1 s (−6 %) |
+| smp_mem_inter_test, `SEMI_PRINTS=0` | 186.0–193.4 s | **175.9 s** | −10 s or more |
+| smp_mem_test, `SEMI_PRINTS=1` | 337.4 s | **308.1 s** | −29.3 s (−8.7 %) |
+| smp_mem_inter_test, `SEMI_PRINTS=1` | 620.5 s | **561.8 s** | −58.7 s (−9.5 %) |
+
+**Reading the numbers:**
+- OpenOCD does fill the larger packets: **8.6× fewer packets** for the same image.
+- The load is still only about **23 % faster**, not 8×. The bit-banging is unchanged per byte (exec totals ≈ 510 ms for smp_mem_test in both builds), the IN transfers drop from 549 to 214 ms in total, but the *rest* of each cycle grows from ≈ 115 µs to ≈ 910 µs. That part is the reception of the request (up to eight 64-byte USB packets, each a tinyusb event on core 0 followed by a re-arm of the endpoint) plus the PC's turnaround. The counters do not separate the two, so how much of it is the per-packet re-arm is **not measured**.
+- The whole tests gain more than their loads (smp_mem_test −3.1 s against −0.4 s of load): the polling and semihosting traffic during the run also travels in fewer, larger packets. This part was not profiled packet by packet. smp_mem_inter_test's earlier runs spread over 186–193 s, so its gain is between 10 and 17 s.
+- With `SEMI_PRINTS=1` the gain is ~9 %. The bulk of those runs is still OpenOCD reading every semihosted string byte by byte (§ 9.5), which the packet size cannot change.
+- Next step on the probe side: time the OUT reception separately, and arm the rest of a request in one transfer once `dap_req_len()` knows its length, instead of one 64-byte packet at a time.
 
 ---
 
@@ -597,7 +634,7 @@ The 2-minute download time is caused almost entirely by **synchronous debug logg
 
 Applying **Patch 1** alone provides an immediate **28× speedup** (reducing 120s down to ~4s). Applying **Patches 2 and 3** brings the download time down to **under 1 second**, fully solving the performance problem while maintaining a clean, responsive hardware UART bridge on `/dev/ttyACM0`.
 
-Measured on a Raspberry Pi 4 B over JTAG (§ 9), where OpenOCD sends about 9.9 loaded bytes per packet and one packet at a time: the optimized FreeRTOS firmware loads at **34–39.5 KB/s** against ~1.05 KB/s for the stock firmware. **JTAGprobe_smp** (µOS++ III SMP, DAP on core 1) first lost a factor of 4 to two cross-core wake-ups per packet (9.95 KB/s); with the DAP thread spinning on its ring and sending its own responses it loads at **37.6–38.1 KB/s**, as fast as the single-core firmware, and the complete smp_mem_test ran in 54.2 s against 140 s. The probe's own counters (§ 9.4) put the core-to-core hand-off at ~7 µs per packet and show that ~70 % of each cycle is now the USB round trip and the PC: the next gains are larger DAP packets and PIO, not a different split between the cores. With semihosting prints on (`SEMI_PRINTS=1`, § 9.5) the tests pass too, at ~0.9 s per semihosted line.
+Measured on a Raspberry Pi 4 B over JTAG (§ 9), where OpenOCD sends about 9.9 loaded bytes per packet and one packet at a time: the optimized FreeRTOS firmware loads at **34–39.5 KB/s** against ~1.05 KB/s for the stock firmware. **JTAGprobe_smp** (µOS++ III SMP, DAP on core 1): its first build lost a factor of 4 to two cross-core wake-ups per packet (9.95 KB/s), which the second build fixed: with the DAP thread spinning on its ring and sending its own responses it loads at **37.6–38.5 KB/s**, as fast as the single-core firmware, and the complete smp_mem_test ran in 50–54 s against 140 s. The probe's own counters (§ 9.4) put the core-to-core hand-off at ~7 µs per packet and show that ~70 % of each cycle was the USB round trip and the PC. The current build therefore uses **512-byte DAP packets** (§ 9.6): 8.6× fewer packets, loads at **48.4–49.3 KB/s** (23 % faster, 1.45× the single-core firmware), and the tests finish faster (smp_mem_test 47.1 s, smp_mem_inter_test 175.9 s; with `SEMI_PRINTS=1` 308.1 s and 561.8 s, all PASS). With semihosting prints on, a semihosted line still costs ~0.9 s, set by OpenOCD (§ 9.5).
 
 ---
 
@@ -605,14 +642,16 @@ Measured on a Raspberry Pi 4 B over JTAG (§ 9), where OpenOCD sends about 9.9 l
 
 | Raspberry Pi 4 B over JTAG, OpenOCD 0.12 | 1 CPU (FreeRTOS JTAGprobe) | 2 CPUs (JTAGprobe_smp) |
 | :--- | ---: | ---: |
-| `load_image`, smp_mem_inter_test (80,984 B) | 2,380 ms (34.0 KB/s) | **2,106–2,143 ms (37.8–38.5 KB/s)** |
+| `load_image`, smp_mem_inter_test (80,984 B) | 2,380 ms (34.0 KB/s) | 2,106–2,143 ms (37.8–38.5 KB/s); **1,644–1,649 ms (49.1–49.3 KB/s)** with 512-byte packets |
 | Probe time per packet (≈ 9.9 loaded bytes) | 251–292 µs | **259–264 µs** |
-| Whole smp_mem_test (CTest) | 140 s | **50–54 s** |
-| Whole smp_mem_inter_test (CTest) | 190 s | 186–193 s |
-| smp_mem_test / smp_mem_inter_test with `SEMI_PRINTS=1` | — | 337 s / 621 s |
+| Whole smp_mem_test (CTest) | 140 s | 50–54 s; **47.1 s** with 512-byte packets |
+| Whole smp_mem_inter_test (CTest) | 190 s | 186–193 s; **175.9 s** with 512-byte packets |
+| smp_mem_test / smp_mem_inter_test with `SEMI_PRINTS=1` | — | 337 s / 621 s; **308 s / 562 s** with 512-byte packets |
+
+The 512-byte packets (§ 9.6) would help a single-core firmware in the same way: they cut round trips, not the hand-off between cores. The comparison of one CPU with two below is therefore made at 64 bytes, where both firmwares were measured.
 
 ### 11.1 JTAG operations
-- **Bulk transfers (`load_image`): about the same.** OpenOCD runs a strict request/reply chain in JTAG mode: one ~64-byte command (≈ 9.9 loaded bytes), then it waits for the answer. In such a chain a second core has nothing to overlap. Of a ~263 µs cycle, the counters of § 9.4 give ~68 µs to the bit-banging on core 1, ~7 µs to the hand-off between the cores, and ~188 µs to the USB transfer and the PC's turnaround. A second core can only *lose* time here, if the hand-off sleeps: the first SMP build woke the other core twice per packet and needed ~1 ms per packet (4× slower). Keeping the packet path free of sleeps (the DAP thread spins on its ring and sends its own reply) is what made the two-core firmware as fast as the single-core one.
+- **Bulk transfers (`load_image`): about the same.** OpenOCD runs a strict request/reply chain in JTAG mode: one ~64-byte command (≈ 9.9 loaded bytes), then it waits for the answer. In such a chain a second core has nothing to overlap. Of a ~263 µs cycle, the counters of § 9.4 give ~68 µs to the bit-banging on core 1, ~7 µs to the hand-off between the cores, and ~188 µs to the USB transfer and the PC's turnaround. A second core can only *lose* time here, if the hand-off sleeps: the first SMP build (history, fixed since the second build) woke the other core twice per packet and needed ~1 ms per packet (4× slower). Keeping the packet path free of sleeps (the DAP thread spins on its ring and sends its own reply) is what made the two-core firmware as fast as the single-core one.
 - **Scattered traffic (a running test): faster.** smp_mem_test, whose run is mostly OpenOCD polling the four Cortex-A72 cores between short exchanges, completed in 50–54 s instead of 140 s. The DAP work on core 1 never waits behind USB event handling or the UART on core 0. The share of each factor was not profiled. Where the test's own computing dominates (smp_mem_inter_test, ~170 s on the Pi), the probe makes no measurable difference (186–193 s against 190 s, within the run-to-run spread).
 
 ### 11.2 UART
@@ -623,8 +662,8 @@ To the probe a semihosting call is ordinary JTAG traffic, so it gains like any s
 
 ### 11.4 Where the next gains are
 Not in another division of work between the two Pico cores (the hand-off is already ~7 µs per packet), but in:
-1. **fewer round trips**: a larger `DAP_PACKET_SIZE` (e.g. 512 bytes over the 64-byte endpoint), so OpenOCD packs more into each command;
-2. **faster bit-banging**: a PIO state machine for TCK/TMS/TDI/TDO;
+1. **fewer round trips**: a larger `DAP_PACKET_SIZE`. **Done** in the current build (512 bytes over the 64-byte endpoint, § 9.6): loads 23 % faster, tests 6–10 % faster. What is left there is the ≈ 910 µs per packet of request reception plus PC turnaround, to be measured and, if it is the per-USB-packet re-arm, reduced by arming the rest of a request in one transfer;
+2. **faster bit-banging**: a PIO state machine for TCK/TMS/TDI/TDO (now ~580 µs of each 1,740 µs cycle);
 3. **the host**: reading semihosting strings in blocks instead of byte by byte.
 
 
